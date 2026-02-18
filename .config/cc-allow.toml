@@ -1,0 +1,150 @@
+# cc-allow Project Configuration
+# Global config (~/.config/cc-allow.toml) provides base rules.
+# Add project-specific overrides below.
+#
+# See: https://github.com/dannycoates/cc-allow
+
+version = "2.0"
+
+# [settings]
+# session_max_age = "7d"  # auto-delete session configs older than this
+
+# [aliases]
+# # Reusable patterns referenced with alias:name
+# test_files = ["path:$PROJECT_ROOT/test/**", "path:$PROJECT_ROOT/tests/**"]
+
+# [bash]
+# default = "ask"
+# dynamic_commands = "ask"
+# unresolved_commands = "ask"  # commands not found on PATH
+# respect_file_rules = true    # check file rules for command args
+
+# [bash.constructs]
+# subshells = "ask"            # $(cmd) or (cmd)
+# background = "deny"          # cmd &
+# function_definitions = "ask" # fn() { ... }
+# heredocs = "ask"             # cmd <<EOF
+
+[bash.allow]
+commands = [
+#   ## Build Tools
+#   # "make", "cmake", "just", "ninja",
+#
+#   ## Rust
+#   # "cargo", "rustc", "rustup", "rustfmt", "clippy-driver",
+#
+#   ## Go
+#   # "go", "gofmt", "gopls",
+#
+#   ## Node.js / JavaScript
+#   # "node", "npm", "npx", "yarn", "pnpm", "bun", "deno",
+#
+#   ## Python
+#   # "python", "python3", "pip", "pip3", "uv", "poetry", "pytest", "ruff", "mypy", "black",
+#
+#   ## Ruby
+#   # "ruby", "gem", "bundle", "rake", "rails",
+#
+#   ## Java / JVM
+#   # "java", "javac", "gradle", "mvn", "ant",
+#
+#   ## .NET
+#   # "dotnet",
+#
+#   ## PHP
+#   # "php", "composer",
+#
+#   ## Elixir / Erlang
+#   # "mix", "elixir", "iex", "erl",
+#
+#   ## Containers
+#   # "docker", "docker-compose", "podman",
+#
+#   ## Kubernetes
+#   # "kubectl", "helm", "kustomize", "k9s", "kubectx", "kubens", "minikube", "kind", "skaffold", "stern", "argocd",
+#
+#   ## Infrastructure / IaC
+#   # "terraform", "tofu", "pulumi", "ansible", "ansible-playbook", "vagrant", "packer",
+#
+#   ## HashiCorp Tools
+#   # "vault", "consul", "nomad",
+]
+
+# [bash.deny]
+# commands = []
+
+# [[bash.allow.example]]
+# # Allow example command
+
+# [[bash.deny.example]]
+# message = "Example rule"
+# args.any = ["--dangerous"]
+
+# Path patterns: use path:$PROJECT_ROOT/** or path:$HOME/** to match paths
+# [[bash.allow.rm]]
+# args.any = ["path:$PROJECT_ROOT/**"]
+
+# Redirect rules: control output/input redirection
+# [bash.redirects]
+# respect_file_rules = true  # apply file rules to redirect targets
+
+# [[bash.redirects.deny]]
+# paths = ["path:$HOME/.*"]
+# message = "Don't redirect to dotfiles"
+
+# [[bash.redirects.allow]]
+# paths = ["path:$PROJECT_ROOT/**"]
+# append = true  # only applies to >> (append mode)
+
+# Heredoc rules: control heredoc content
+# [[bash.heredocs.deny]]
+# content.any = ["rm -rf", "curl | bash"]
+# message = "Dangerous heredoc content"
+
+# [read]
+# default = "ask"
+
+# [[read.allow]]
+# paths = ["path:$PROJECT_ROOT/**"]
+
+# [[read.deny]]
+# paths = ["path:$HOME/.ssh/**"]
+# message = "SSH keys are sensitive"
+
+# [edit]
+# default = "ask"
+
+# [[edit.allow]]
+# paths = ["path:$PROJECT_ROOT/**"]
+
+# [[edit.deny]]
+# paths = ["*.min.js", "*.min.css"]
+# message = "Don't edit minified files"
+
+# [write]
+# default = "ask"
+
+# [[write.allow]]
+# paths = ["path:$PROJECT_ROOT/**"]
+
+# [[write.deny]]
+# paths = ["path:$HOME/.bashrc", "path:$HOME/.zshrc"]
+# message = "Protect shell config files"
+
+# [debug]
+# log_dir = "/tmp/cc-allow-debug"  # directory for per-session debug logs
+
+# [webfetch]
+# default = "allow"
+# default_message = "URL fetch requires approval: {{.FilePath}}"
+
+# [webfetch.safe_browsing]
+# enabled = true
+# # use your own key - not this one
+# api_key = "AIzaSyBPGXa4AYD4FC3HJK7LnIKxm4fDusVuuco"
+
+# [glob]
+# respect_file_rules = true
+
+# [grep]
+# respect_file_rules = true

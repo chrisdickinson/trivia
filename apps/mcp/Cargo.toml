@@ -1,0 +1,14 @@
+[package]
+name = "trivia-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+trivia-core = { path = "../../crates/core" }
+tower-mcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }

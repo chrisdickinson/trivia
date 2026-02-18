@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "trivia": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "${CLAUDE_PLUGIN_ROOT}/apps/mcp/Cargo.toml",
+        "--release",
+        "--quiet"
+      ]
+    }
+  }
+}

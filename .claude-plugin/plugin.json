@@ -1,0 +1,5 @@
+{
+  "name": "trivia",
+  "description": "Semantic memory for Claude Code — memorize and recall project context",
+  "version": "0.1.0"
+}
