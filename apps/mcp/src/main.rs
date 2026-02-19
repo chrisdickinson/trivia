@@ -36,6 +36,16 @@ struct RecallInput {
     tags: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LinkInput {
+    /// Mnemonic of the source memory
+    source: String,
+    /// Mnemonic of the target memory
+    target: String,
+    /// Type of link: "related", "supersedes", or "derived_from"
+    link_type: String,
+}
+
 fn db_path() -> PathBuf {
     if let Ok(path) = std::env::var("TRIVIA_DB") {
         PathBuf::from(path)
@@ -71,6 +81,7 @@ async fn main() -> Result<()> {
             }
         })
         .build();
+
     let app = state.clone();
     let recall = ToolBuilder::new("recall")
         .description("Retrieve previously memorized facts by semantic similarity. Provide a natural language query describing what you're looking for.")
@@ -100,6 +111,21 @@ async fn main() -> Result<()> {
                     if !mem.tags.is_empty() {
                         output.push_str(&format!("   tags: {}\n", mem.tags.join(", ")));
                     }
+                    if !mem.links.is_empty() {
+                        let link_strs: Vec<String> = mem
+                            .links
+                            .iter()
+                            .map(|l| {
+                                let other = if l.source_mnemonic == mem.mnemonic {
+                                    &l.target_mnemonic
+                                } else {
+                                    &l.source_mnemonic
+                                };
+                                format!("{} ({})", other, l.link_type)
+                            })
+                            .collect();
+                        output.push_str(&format!("   links: {}\n", link_strs.join(", ")));
+                    }
                     output.push('\n');
                 }
                 Ok(CallToolResult::text(output))
@@ -107,11 +133,31 @@ async fn main() -> Result<()> {
        })
         .build();
 
+    let app = state.clone();
+    let link = ToolBuilder::new("link")
+        .description("Create a link between two memories. Link types: \"related\", \"supersedes\", \"derived_from\".")
+        .handler(move |input: LinkInput| {
+            let app = app.clone();
+            async move {
+                app.store
+                    .lock()
+                    .await
+                    .link(&input.source, &input.target, &input.link_type)
+                    .tool_context("link failed")?;
+                Ok(CallToolResult::text(format!(
+                    "Linked: {} --[{}]--> {}",
+                    input.source, input.link_type, input.target
+                )))
+            }
+        })
+        .build();
+
     let router = McpRouter::new()
         .server_info("trivia", "0.1.0")
-        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, and `recall` to retrieve them by semantic similarity.")
+        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity, and `link` to create explicit links between memories.")
         .tool(memorize)
-        .tool(recall);
+        .tool(recall)
+        .tool(link);
 
     StdioTransport::new(router).run().await?;
     Ok(())
