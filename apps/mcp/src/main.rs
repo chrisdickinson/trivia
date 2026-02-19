@@ -91,10 +91,11 @@ async fn main() -> Result<()> {
                 let mut output = String::new();
                 for (i, mem) in memories.iter().enumerate() {
                     output.push_str(&format!(
-                        "{}. [{}] (distance: {:.4})\n{}\n",
+                        "{}. [{}] (distance: {:.4}, recalled: {} times)\n{}\n",
                         i + 1,
                         mem.mnemonic,
                         mem.distance,
+                        mem.recall_count,
                         mem.content,
                     ));
                     if !mem.tags.is_empty() {

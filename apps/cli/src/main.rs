@@ -86,10 +86,11 @@ fn main() -> Result<()> {
             } else {
                 for (i, mem) in memories.iter().enumerate() {
                     println!(
-                        "{}. [{}] (distance: {:.4})\n{}",
+                        "{}. [{}] (distance: {:.4}, recalled: {} times)\n{}",
                         i + 1,
                         mem.mnemonic,
                         mem.distance,
+                        mem.recall_count,
                         mem.content,
                     );
                     if !mem.tags.is_empty() {

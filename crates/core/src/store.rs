@@ -22,6 +22,8 @@ pub struct Memory {
     pub tags: Vec<String>,
     pub distance: f64,
     pub updated_at: String,
+    pub recall_count: i64,
+    pub last_recalled_at: Option<String>,
 }
 
 pub struct MemoryStore {
@@ -60,7 +62,9 @@ impl MemoryStore {
                 content TEXT NOT NULL,
                 tags TEXT DEFAULT '[]',
                 created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
+                updated_at TEXT DEFAULT (datetime('now')),
+                recall_count INTEGER NOT NULL DEFAULT 0,
+                last_recalled_at TEXT
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
@@ -68,6 +72,18 @@ impl MemoryStore {
                 embedding float[384]
             );",
         )?;
+
+        // Handle existing DBs that lack the new columns
+        let add_column = |sql: &str| -> Result<()> {
+            match self.conn.execute_batch(sql) {
+                Ok(_) => Ok(()),
+                Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        };
+        add_column("ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;")?;
+        add_column("ALTER TABLE memories ADD COLUMN last_recalled_at TEXT;")?;
+
         Ok(())
     }
 
@@ -126,7 +142,7 @@ impl MemoryStore {
             None => limit,
         };
 
-        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at
+        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at, m.recall_count, m.last_recalled_at
              FROM memory_vectors v
              JOIN memories m ON m.id = v.memory_id
              WHERE v.embedding MATCH ?1
@@ -143,6 +159,8 @@ impl MemoryStore {
                     tags_json: row.get(2)?,
                     distance: row.get(3)?,
                     updated_at: row.get(4)?,
+                    recall_count: row.get(5)?,
+                    last_recalled_at: row.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -158,6 +176,8 @@ impl MemoryStore {
                     tags: row_tags,
                     distance: row.distance,
                     updated_at: row.updated_at,
+                    recall_count: row.recall_count,
+                    last_recalled_at: row.last_recalled_at,
                 }
             })
             .filter(|mem| match tags {
@@ -166,6 +186,22 @@ impl MemoryStore {
             })
             .take(limit)
             .collect();
+
+        // Update recall stats for all returned memories
+        let mnemonics: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
+        if !mnemonics.is_empty() {
+            let placeholders: Vec<String> =
+                (1..=mnemonics.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE mnemonic IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> = mnemonics
+                .iter()
+                .map(|m| m as &dyn rusqlite::types::ToSql)
+                .collect();
+            self.conn.execute(&sql, params.as_slice())?;
+        }
 
         Ok(memories)
     }
@@ -177,6 +213,8 @@ struct MemoryRow {
     tags_json: String,
     distance: f64,
     updated_at: String,
+    recall_count: i64,
+    last_recalled_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -206,6 +244,12 @@ mod tests {
         // Both should be returned, closest first
         assert!(results[0].distance <= results[1].distance);
 
+        // New fields should reflect the recall that just happened
+        assert_eq!(results[0].recall_count, 0);
+        assert_eq!(results[1].recall_count, 0);
+        assert!(results[0].last_recalled_at.is_none());
+        assert!(results[1].last_recalled_at.is_none());
+
         Ok(())
     }
 
@@ -221,6 +265,32 @@ mod tests {
         let results = store.recall(&emb2, 5, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "updated content");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recall_tracking() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+
+        let emb: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store.memorize("tracked::fact", "some content", &[], &emb)?;
+
+        // First recall — returned snapshot has count=0 (pre-update value)
+        let results = store.recall(&emb, 5, None)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].recall_count, 0);
+        assert!(results[0].last_recalled_at.is_none());
+
+        // Second recall — DB was updated by the first recall, so now count=1
+        let results = store.recall(&emb, 5, None)?;
+        assert_eq!(results[0].recall_count, 1);
+        assert!(results[0].last_recalled_at.is_some());
+
+        // Third recall — count should be 2
+        let results = store.recall(&emb, 5, None)?;
+        assert_eq!(results[0].recall_count, 2);
+        assert!(results[0].last_recalled_at.is_some());
 
         Ok(())
     }
