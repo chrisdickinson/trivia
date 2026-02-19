@@ -37,6 +37,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Create a link between two memories
+    Link {
+        /// Mnemonic of the source memory
+        source: String,
+        /// Mnemonic of the target memory
+        target: String,
+        /// Type of link: related, supersedes, derived_from
+        #[arg(long, short = 't', default_value = "related")]
+        link_type: String,
+    },
+    /// Show all links for a memory
+    Links {
+        /// Mnemonic to show links for
+        mnemonic: String,
+    },
 }
 
 fn db_path() -> PathBuf {
@@ -96,7 +111,43 @@ fn main() -> Result<()> {
                     if !mem.tags.is_empty() {
                         println!("   tags: {}", mem.tags.join(", "));
                     }
+                    if !mem.links.is_empty() {
+                        let link_strs: Vec<String> = mem
+                            .links
+                            .iter()
+                            .map(|l| {
+                                let other = if l.source_mnemonic == mem.mnemonic {
+                                    &l.target_mnemonic
+                                } else {
+                                    &l.source_mnemonic
+                                };
+                                format!("{} ({})", other, l.link_type)
+                            })
+                            .collect();
+                        println!("   links: {}", link_strs.join(", "));
+                    }
                     println!();
+                }
+            }
+        }
+        Command::Link {
+            source,
+            target,
+            link_type,
+        } => {
+            store.link(&source, &target, &link_type)?;
+            println!("Linked: {} --[{}]--> {}", source, link_type, target);
+        }
+        Command::Links { mnemonic } => {
+            let links = store.get_links(&mnemonic)?;
+            if links.is_empty() {
+                println!("No links found for: {mnemonic}");
+            } else {
+                for link in &links {
+                    println!(
+                        "{} --[{}]--> {}",
+                        link.source_mnemonic, link.link_type, link.target_mnemonic
+                    );
                 }
             }
         }

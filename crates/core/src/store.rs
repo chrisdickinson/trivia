@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
 use serde::{Deserialize, Serialize};
 use sqlite_vec::sqlite3_vec_init;
@@ -7,6 +7,9 @@ use std::sync::Once;
 use zerocopy::AsBytes;
 
 static VEC_INIT: Once = Once::new();
+
+const AUTO_LINK_THRESHOLD: f64 = 0.3;
+const AUTO_LINK_MAX_NEIGHBORS: usize = 5;
 
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| unsafe {
@@ -24,10 +27,24 @@ pub struct Memory {
     pub updated_at: String,
     pub recall_count: i64,
     pub last_recalled_at: Option<String>,
+    pub links: Vec<MemoryLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLink {
+    pub source_mnemonic: String,
+    pub target_mnemonic: String,
+    pub link_type: String,
+    pub created_at: String,
 }
 
 pub struct MemoryStore {
     conn: Connection,
+}
+
+fn open_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(())
 }
 
 impl MemoryStore {
@@ -41,6 +58,7 @@ impl MemoryStore {
 
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening database: {}", db_path.display()))?;
+        open_connection(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -49,6 +67,7 @@ impl MemoryStore {
     pub fn in_memory() -> Result<Self> {
         register_sqlite_vec();
         let conn = Connection::open_in_memory()?;
+        open_connection(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -70,6 +89,15 @@ impl MemoryStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
                 memory_id INTEGER PRIMARY KEY,
                 embedding float[384]
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                link_type TEXT NOT NULL CHECK(link_type IN ('related', 'supersedes', 'derived_from')),
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(source_id, target_id, link_type)
             );",
         )?;
 
@@ -125,8 +153,134 @@ impl MemoryStore {
             params![memory_id, embedding.as_bytes()],
         )?;
 
+        // After inserting the vector, find nearby memories for auto-linking
+        let neighbors: Vec<(i64, f64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT v.memory_id, v.distance
+                 FROM memory_vectors v
+                 WHERE v.embedding MATCH ?1
+                 AND v.k = ?2
+                 ORDER BY v.distance",
+            )?;
+            stmt.query_map(
+                params![embedding.as_bytes(), AUTO_LINK_MAX_NEIGHBORS + 1],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        for (neighbor_id, distance) in &neighbors {
+            if *neighbor_id != memory_id && *distance < AUTO_LINK_THRESHOLD {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
+                     VALUES (?1, ?2, 'related')",
+                    params![memory_id, neighbor_id],
+                )?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn link(
+        &self,
+        source_mnemonic: &str,
+        target_mnemonic: &str,
+        link_type: &str,
+    ) -> Result<()> {
+        let source_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE mnemonic = ?1",
+                params![source_mnemonic],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("source mnemonic not found: {}", source_mnemonic))?;
+
+        let target_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE mnemonic = ?1",
+                params![target_mnemonic],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("target mnemonic not found: {}", target_mnemonic))?;
+
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
+             VALUES (?1, ?2, ?3)",
+            params![source_id, target_id, link_type],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn unlink(
+        &self,
+        source_mnemonic: &str,
+        target_mnemonic: &str,
+        link_type: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM memory_links
+             WHERE source_id = (SELECT id FROM memories WHERE mnemonic = ?1)
+             AND target_id = (SELECT id FROM memories WHERE mnemonic = ?2)
+             AND link_type = ?3",
+            params![source_mnemonic, target_mnemonic, link_type],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_links(&self, mnemonic: &str) -> Result<Vec<MemoryLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.mnemonic, t.mnemonic, ml.link_type, ml.created_at
+             FROM memory_links ml
+             JOIN memories s ON s.id = ml.source_id
+             JOIN memories t ON t.id = ml.target_id
+             WHERE s.mnemonic = ?1 OR t.mnemonic = ?1",
+        )?;
+
+        let links = stmt
+            .query_map(params![mnemonic], |row| {
+                Ok(MemoryLink {
+                    source_mnemonic: row.get(0)?,
+                    target_mnemonic: row.get(1)?,
+                    link_type: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(links)
+    }
+
+    pub fn find_nearest(
+        &self,
+        embedding: &[f32],
+        threshold: f64,
+        exclude_mnemonic: &str,
+    ) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.mnemonic, v.distance
+             FROM memory_vectors v
+             JOIN memories m ON m.id = v.memory_id
+             WHERE v.embedding MATCH ?1
+             AND v.k = ?2
+             ORDER BY v.distance",
+        )?;
+
+        let results: Vec<(String, f64)> = stmt
+            .query_map(
+                params![embedding.as_bytes(), AUTO_LINK_MAX_NEIGHBORS + 1],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(mnemonic, distance)| mnemonic != exclude_mnemonic && *distance < threshold)
+            .collect();
+
+        Ok(results)
     }
 
     pub fn recall(
@@ -165,7 +319,7 @@ impl MemoryStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let memories: Vec<Memory> = rows
+        let mut memories: Vec<Memory> = rows
             .into_iter()
             .map(|row| {
                 let row_tags: Vec<String> =
@@ -178,6 +332,7 @@ impl MemoryStore {
                     updated_at: row.updated_at,
                     recall_count: row.recall_count,
                     last_recalled_at: row.last_recalled_at,
+                    links: Vec::new(),
                 }
             })
             .filter(|mem| match tags {
@@ -186,6 +341,11 @@ impl MemoryStore {
             })
             .take(limit)
             .collect();
+
+        // Populate links for each recalled memory
+        for mem in &mut memories {
+            mem.links = self.get_links(&mem.mnemonic)?;
+        }
 
         // Update recall stats for all returned memories
         let mnemonics: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
@@ -244,7 +404,7 @@ mod tests {
         // Both should be returned, closest first
         assert!(results[0].distance <= results[1].distance);
 
-        // New fields should reflect the recall that just happened
+        // Pre-update snapshot: count=0, never recalled
         assert_eq!(results[0].recall_count, 0);
         assert_eq!(results[1].recall_count, 0);
         assert!(results[0].last_recalled_at.is_none());
@@ -291,6 +451,160 @@ mod tests {
         let results = store.recall(&emb, 5, None)?;
         assert_eq!(results[0].recall_count, 2);
         assert!(results[0].last_recalled_at.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_link() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        // Use a very different embedding so auto-link doesn't fire
+        let emb2: Vec<f32> = vec![-0.5; 384];
+
+        store.memorize("alpha", "first memory", &[], &emb1)?;
+        store.memorize("beta", "second memory", &[], &emb2)?;
+
+        store.link("alpha", "beta", "related")?;
+
+        let links = store.get_links("alpha")?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_mnemonic, "alpha");
+        assert_eq!(links[0].target_mnemonic, "beta");
+        assert_eq!(links[0].link_type, "related");
+
+        // Link is also visible from beta's perspective
+        let links_beta = store.get_links("beta")?;
+        assert_eq!(links_beta.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_auto_link_similar_memories() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+
+        // Two very similar embeddings — should be auto-linked
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.001).collect();
+
+        store.memorize("similar::a", "topic A", &[], &emb1)?;
+        store.memorize("similar::b", "topic B", &[], &emb2)?;
+
+        let links = store.get_links("similar::b")?;
+        assert!(
+            !links.is_empty(),
+            "auto-link should create a link between similar memories"
+        );
+        assert_eq!(links[0].link_type, "related");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_links() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+        let emb3: Vec<f32> = vec![0.9; 384];
+
+        store.memorize("x", "mem x", &[], &emb1)?;
+        store.memorize("y", "mem y", &[], &emb2)?;
+        store.memorize("z", "mem z", &[], &emb3)?;
+
+        store.link("x", "y", "supersedes")?;
+        store.link("z", "x", "derived_from")?;
+
+        let links = store.get_links("x")?;
+        assert_eq!(links.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlink() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+
+        store.memorize("a", "mem a", &[], &emb1)?;
+        store.memorize("b", "mem b", &[], &emb2)?;
+
+        store.link("a", "b", "related")?;
+        assert_eq!(store.get_links("a")?.len(), 1);
+
+        store.unlink("a", "b", "related")?;
+        assert_eq!(store.get_links("a")?.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_links_survive_upsert() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+
+        store.memorize("p", "original", &[], &emb1)?;
+        store.memorize("q", "other", &[], &emb2)?;
+        store.link("p", "q", "related")?;
+
+        // Upsert p with new content
+        store.memorize("p", "updated", &[], &emb1)?;
+
+        let links = store.get_links("p")?;
+        assert!(
+            links.iter().any(|l| l.target_mnemonic == "q"),
+            "link should survive upsert"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_idempotent() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+
+        store.memorize("m1", "first", &[], &emb1)?;
+        store.memorize("m2", "second", &[], &emb2)?;
+
+        store.link("m1", "m2", "related")?;
+        store.link("m1", "m2", "related")?; // should not error
+
+        let links = store.get_links("m1")?;
+        assert_eq!(links.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_missing_mnemonic() {
+        let store = MemoryStore::in_memory().unwrap();
+        let emb: Vec<f32> = vec![0.1; 384];
+        store.memorize("exists", "content", &[], &emb).unwrap();
+
+        let result = store.link("exists", "does_not_exist", "related");
+        assert!(result.is_err());
+
+        let result = store.link("does_not_exist", "exists", "related");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_recall_includes_links() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+
+        store.memorize("r1", "recall target", &[], &emb1)?;
+        store.memorize("r2", "other memory", &[], &emb2)?;
+        store.link("r1", "r2", "supersedes")?;
+
+        let results = store.recall(&emb1, 5, None)?;
+        let r1 = results.iter().find(|m| m.mnemonic == "r1").unwrap();
+        assert!(!r1.links.is_empty(), "recalled memory should include links");
 
         Ok(())
     }
