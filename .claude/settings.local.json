@@ -3,7 +3,8 @@
     "allow": [
       "WebSearch",
       "Bash(cargo build:*)",
-      "mcp__plugin_trivia_trivia__memorize"
+      "mcp__plugin_trivia_trivia__memorize",
+      "mcp__trivia__memorize"
     ]
   },
   "enableAllProjectMcpServers": true,

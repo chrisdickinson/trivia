@@ -1,5 +1,7 @@
 set positional-arguments
 
+export CLAUDE_PLUGIN_ROOT := justfile_directory()
+
 _help:
 	just -l
 

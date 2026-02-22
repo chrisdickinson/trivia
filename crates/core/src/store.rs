@@ -4,12 +4,35 @@ use serde::{Deserialize, Serialize};
 use sqlite_vec::sqlite3_vec_init;
 use std::path::Path;
 use std::sync::Once;
+use uuid::Uuid;
 use zerocopy::AsBytes;
 
 static VEC_INIT: Once = Once::new();
 
 const AUTO_LINK_THRESHOLD: f64 = 0.3;
 const AUTO_LINK_MAX_NEIGHBORS: usize = 5;
+const AUTO_MERGE_THRESHOLD: f64 = 0.15;
+
+#[derive(Debug, Clone)]
+pub struct ScoringConfig {
+    pub similarity_weight: f64,
+    pub recency_weight: f64,
+    pub frequency_weight: f64,
+    pub link_weight: f64,
+    pub half_life_days: f64,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            similarity_weight: 1.0,
+            recency_weight: 0.1,
+            frequency_weight: 0.05,
+            link_weight: 0.1,
+            half_life_days: 7.0,
+        }
+    }
+}
 
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| unsafe {
@@ -24,6 +47,7 @@ pub struct Memory {
     pub content: String,
     pub tags: Vec<String>,
     pub distance: f64,
+    pub score: f64,
     pub updated_at: String,
     pub recall_count: i64,
     pub last_recalled_at: Option<String>,
@@ -40,6 +64,7 @@ pub struct MemoryLink {
 
 pub struct MemoryStore {
     conn: Connection,
+    scoring: ScoringConfig,
 }
 
 fn open_connection(conn: &Connection) -> Result<()> {
@@ -59,7 +84,10 @@ impl MemoryStore {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening database: {}", db_path.display()))?;
         open_connection(&conn)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            scoring: ScoringConfig::default(),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -68,9 +96,16 @@ impl MemoryStore {
         register_sqlite_vec();
         let conn = Connection::open_in_memory()?;
         open_connection(&conn)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            scoring: ScoringConfig::default(),
+        };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     fn migrate(&self) -> Result<()> {
@@ -111,6 +146,16 @@ impl MemoryStore {
         };
         add_column("ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;")?;
         add_column("ALTER TABLE memories ADD COLUMN last_recalled_at TEXT;")?;
+        add_column("ALTER TABLE memories ADD COLUMN uuid TEXT;")?;
+
+        // Backfill UUIDs for existing rows
+        self.conn.execute_batch(
+            "UPDATE memories SET uuid = lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6))) WHERE uuid IS NULL;"
+        )?;
+
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_uuid ON memories(uuid);"
+        )?;
 
         Ok(())
     }
@@ -127,14 +172,15 @@ impl MemoryStore {
         let tx = self.conn.unchecked_transaction()?;
 
         // Upsert the memory text
+        let new_uuid = Uuid::new_v4().to_string();
         tx.execute(
-            "INSERT INTO memories (mnemonic, content, tags)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO memories (mnemonic, content, tags, uuid)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(mnemonic) DO UPDATE SET
                 content = excluded.content,
                 tags = excluded.tags,
                 updated_at = datetime('now')",
-            params![mnemonic, content, tags_json],
+            params![mnemonic, content, tags_json, new_uuid],
         )?;
 
         let memory_id: i64 = tx.query_row(
@@ -169,13 +215,80 @@ impl MemoryStore {
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        for (neighbor_id, distance) in &neighbors {
-            if *neighbor_id != memory_id && *distance < AUTO_LINK_THRESHOLD {
-                tx.execute(
-                    "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
-                     VALUES (?1, ?2, 'related')",
-                    params![memory_id, neighbor_id],
-                )?;
+        // Check for auto-merge candidate (closest neighbor below merge threshold)
+        let merge_candidate: Option<(i64, String, String, String)> = neighbors
+            .iter()
+            .filter(|(nid, dist)| *nid != memory_id && *dist < AUTO_MERGE_THRESHOLD)
+            .next()
+            .map(|(nid, _)| {
+                tx.query_row(
+                    "SELECT id, mnemonic, content, tags FROM memories WHERE id = ?1",
+                    params![nid],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+            })
+            .transpose()?;
+
+        if let Some((old_id, _old_mnemonic, old_content, old_tags_json)) = merge_candidate {
+            // Concatenate content: new + old
+            let merged_content = format!("{content}\n\n{old_content}");
+            // Union tags
+            let old_tags: Vec<String> =
+                serde_json::from_str(&old_tags_json).unwrap_or_default();
+            let mut merged_tags: Vec<String> = tags.to_vec();
+            for t in old_tags {
+                if !merged_tags.contains(&t) {
+                    merged_tags.push(t);
+                }
+            }
+            let merged_tags_json = serde_json::to_string(&merged_tags)?;
+
+            // Update the new memory with merged content and tags
+            tx.execute(
+                "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
+                params![merged_content, merged_tags_json, memory_id],
+            )?;
+
+            // Transfer links from old to new
+            tx.execute(
+                "UPDATE OR IGNORE memory_links SET source_id = ?1 WHERE source_id = ?2",
+                params![memory_id, old_id],
+            )?;
+            tx.execute(
+                "UPDATE OR IGNORE memory_links SET target_id = ?1 WHERE target_id = ?2",
+                params![memory_id, old_id],
+            )?;
+            // Clean up any self-links created by transfer
+            tx.execute(
+                "DELETE FROM memory_links WHERE source_id = target_id",
+                [],
+            )?;
+
+            // Create supersedes link
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type) VALUES (?1, ?2, 'supersedes')",
+                params![memory_id, old_id],
+            )?;
+
+            // Delete old memory (CASCADE handles vectors + remaining links)
+            tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
+        } else {
+            // No merge — just auto-link
+            for (neighbor_id, distance) in &neighbors {
+                if *neighbor_id != memory_id && *distance < AUTO_LINK_THRESHOLD {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
+                         VALUES (?1, ?2, 'related')",
+                        params![memory_id, neighbor_id],
+                    )?;
+                }
             }
         }
 
@@ -283,17 +396,96 @@ impl MemoryStore {
         Ok(results)
     }
 
+    /// Merge two memories: keep absorbs discard's content, tags, and links.
+    /// The embedding should be the re-embedded mnemonic of `keep`.
+    pub fn merge(&self, keep: &str, discard: &str, embedding: &[f32]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let (keep_id, keep_content, keep_tags_json): (i64, String, String) = tx
+            .query_row(
+                "SELECT id, content, tags FROM memories WHERE mnemonic = ?1",
+                params![keep],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| anyhow!("mnemonic not found: {}", keep))?;
+
+        let (discard_id, discard_content, discard_tags_json): (i64, String, String) = tx
+            .query_row(
+                "SELECT id, content, tags FROM memories WHERE mnemonic = ?1",
+                params![discard],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| anyhow!("mnemonic not found: {}", discard))?;
+
+        // Concatenate content
+        let merged_content = format!("{keep_content}\n\n{discard_content}");
+
+        // Union tags
+        let keep_tags: Vec<String> = serde_json::from_str(&keep_tags_json).unwrap_or_default();
+        let discard_tags: Vec<String> =
+            serde_json::from_str(&discard_tags_json).unwrap_or_default();
+        let mut merged_tags = keep_tags;
+        for t in discard_tags {
+            if !merged_tags.contains(&t) {
+                merged_tags.push(t);
+            }
+        }
+        let merged_tags_json = serde_json::to_string(&merged_tags)?;
+
+        // Update keep with merged content/tags
+        tx.execute(
+            "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![merged_content, merged_tags_json, keep_id],
+        )?;
+
+        // Re-embed
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE memory_id = ?1",
+            params![keep_id],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+            params![keep_id, embedding.as_bytes()],
+        )?;
+
+        // Transfer links from discard to keep
+        tx.execute(
+            "UPDATE OR IGNORE memory_links SET source_id = ?1 WHERE source_id = ?2",
+            params![keep_id, discard_id],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE memory_links SET target_id = ?1 WHERE target_id = ?2",
+            params![keep_id, discard_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_links WHERE source_id = target_id",
+            [],
+        )?;
+
+        // Create supersedes link
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type) VALUES (?1, ?2, 'supersedes')",
+            params![keep_id, discard_id],
+        )?;
+
+        // Delete discard
+        tx.execute("DELETE FROM memories WHERE id = ?1", params![discard_id])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn recall(
         &self,
         query_embedding: &[f32],
         limit: usize,
         tags: Option<&[String]>,
     ) -> Result<Vec<Memory>> {
-        // sqlite-vec requires k=? in the WHERE clause for KNN queries.
-        // When filtering by tags, fetch extra results and filter post-query.
+        // Overfetch 3x for composite scoring reranking
+        let base_fetch = limit * 3;
         let fetch_limit = match tags {
-            Some(_) => limit * 4,
-            None => limit,
+            Some(_) => base_fetch * 4,
+            None => base_fetch,
         };
 
         let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at, m.recall_count, m.last_recalled_at
@@ -329,6 +521,7 @@ impl MemoryStore {
                     content: row.content,
                     tags: row_tags,
                     distance: row.distance,
+                    score: 0.0,
                     updated_at: row.updated_at,
                     recall_count: row.recall_count,
                     last_recalled_at: row.last_recalled_at,
@@ -339,13 +532,61 @@ impl MemoryStore {
                 Some(filter_tags) => filter_tags.iter().any(|t| mem.tags.contains(t)),
                 None => true,
             })
-            .take(limit)
             .collect();
 
-        // Populate links for each recalled memory
+        // Populate links for each candidate
         for mem in &mut memories {
             mem.links = self.get_links(&mem.mnemonic)?;
         }
+
+        // Compute composite scores
+        // Pre-collect similarity map to avoid borrow conflict
+        let similarity_map: std::collections::HashMap<String, f64> = memories
+            .iter()
+            .map(|m| (m.mnemonic.clone(), 1.0 - m.distance))
+            .collect();
+        let lambda = (2.0_f64).ln() / self.scoring.half_life_days;
+        let now = self
+            .conn
+            .query_row("SELECT datetime('now')", [], |row| row.get::<_, String>(0))?;
+
+        for mem in &mut memories {
+            let similarity = 1.0 - mem.distance;
+
+            let recency = match &mem.last_recalled_at {
+                Some(ts) => {
+                    let days = days_between(ts, &now);
+                    (-lambda * days).exp()
+                }
+                None => 0.0,
+            };
+
+            let frequency = (1.0 + mem.recall_count as f64).ln();
+
+            // Link boost: sum similarity of linked candidates (cap 3)
+            let link_boost: f64 = mem
+                .links
+                .iter()
+                .filter_map(|l| {
+                    let other = if l.source_mnemonic == mem.mnemonic {
+                        &l.target_mnemonic
+                    } else {
+                        &l.source_mnemonic
+                    };
+                    similarity_map.get(other).copied()
+                })
+                .take(3)
+                .sum();
+
+            mem.score = self.scoring.similarity_weight * similarity
+                + self.scoring.recency_weight * recency
+                + self.scoring.frequency_weight * frequency
+                + self.scoring.link_weight * link_boost;
+        }
+
+        // Sort by score descending, take limit
+        memories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        memories.truncate(limit);
 
         // Update recall stats for all returned memories
         let mnemonics: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
@@ -365,6 +606,109 @@ impl MemoryStore {
 
         Ok(memories)
     }
+
+    pub fn list_all_summaries(&self) -> Result<Vec<MemorySummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT mnemonic, content, tags, recall_count
+             FROM memories
+             ORDER BY recall_count DESC, updated_at DESC",
+        )?;
+
+        let results = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(mnemonic, content, tags_json, recall_count)| {
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                MemorySummary {
+                    mnemonic,
+                    content,
+                    tags,
+                    recall_count,
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    pub fn find_merge_candidates(
+        &self,
+        embedding: &[f32],
+        threshold: f64,
+        exclude: &std::collections::HashSet<String>,
+        limit: usize,
+    ) -> Result<Vec<MergeCandidate>> {
+        let fetch = limit + exclude.len() + 1;
+        let mut stmt = self.conn.prepare(
+            "SELECT m.mnemonic, m.content, m.tags, v.distance, m.recall_count
+             FROM memory_vectors v
+             JOIN memories m ON m.id = v.memory_id
+             WHERE v.embedding MATCH ?1
+             AND v.k = ?2
+             ORDER BY v.distance",
+        )?;
+
+        let results = stmt
+            .query_map(params![embedding.as_bytes(), fetch], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(mnemonic, _, _, distance, _)| {
+                !exclude.contains(mnemonic) && *distance < threshold
+            })
+            .take(limit)
+            .map(|(mnemonic, content, tags_json, distance, recall_count)| {
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                MergeCandidate {
+                    mnemonic,
+                    content,
+                    tags,
+                    distance,
+                    recall_count,
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+}
+
+/// Parse SQLite datetime strings and return days elapsed between them.
+fn days_between(earlier: &str, later: &str) -> f64 {
+    // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
+    fn parse_timestamp(s: &str) -> Option<f64> {
+        let parts: Vec<&str> = s.split(|c| c == '-' || c == ' ' || c == ':').collect();
+        if parts.len() < 6 {
+            return None;
+        }
+        let year: f64 = parts[0].parse().ok()?;
+        let month: f64 = parts[1].parse().ok()?;
+        let day: f64 = parts[2].parse().ok()?;
+        let hour: f64 = parts[3].parse().ok()?;
+        let min: f64 = parts[4].parse().ok()?;
+        let sec: f64 = parts[5].parse().ok()?;
+        // Approximate days since epoch (good enough for deltas)
+        Some(year * 365.25 + month * 30.44 + day + (hour + min / 60.0 + sec / 3600.0) / 24.0)
+    }
+    match (parse_timestamp(earlier), parse_timestamp(later)) {
+        (Some(e), Some(l)) => (l - e).max(0.0),
+        _ => 0.0,
+    }
 }
 
 struct MemoryRow {
@@ -375,6 +719,23 @@ struct MemoryRow {
     updated_at: String,
     recall_count: i64,
     last_recalled_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemorySummary {
+    pub mnemonic: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub recall_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeCandidate {
+    pub mnemonic: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub distance: f64,
+    pub recall_count: i64,
 }
 
 #[cfg(test)]
@@ -484,9 +845,10 @@ mod tests {
     fn test_auto_link_similar_memories() -> Result<()> {
         let store = MemoryStore::in_memory()?;
 
-        // Two very similar embeddings — should be auto-linked
+        // Embeddings in the auto-link zone (distance between 0.15 and 0.3)
+        // offset 0.01 → L2 distance ≈ sqrt(384 * 0.01²) ≈ 0.196
         let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
-        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.001).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.01).collect();
 
         store.memorize("similar::a", "topic A", &[], &emb1)?;
         store.memorize("similar::b", "topic B", &[], &emb2)?;
@@ -605,6 +967,160 @@ mod tests {
         let results = store.recall(&emb1, 5, None)?;
         let r1 = results.iter().find(|m| m.mnemonic == "r1").unwrap();
         assert!(!r1.links.is_empty(), "recalled memory should include links");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_score_field_populated() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store.memorize("scored", "content", &[], &emb)?;
+
+        let results = store.recall(&emb, 5, None)?;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 0.0, "score should be positive for close match");
+        Ok(())
+    }
+
+    #[test]
+    fn test_frequency_boosts_score() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.01).collect();
+
+        store.memorize("freq::a", "frequently recalled", &[], &emb1)?;
+        store.memorize("freq::b", "rarely recalled", &[], &emb2)?;
+
+        // Recall several times to boost freq::a's recall_count
+        for _ in 0..5 {
+            store.recall(&emb1, 1, None)?;
+        }
+
+        // Query equidistant — freq::a should score higher due to frequency
+        let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
+        let results = store.recall(&mid, 2, None)?;
+        assert_eq!(results.len(), 2);
+
+        let a = results.iter().find(|m| m.mnemonic == "freq::a").unwrap();
+        let b = results.iter().find(|m| m.mnemonic == "freq::b").unwrap();
+        assert!(a.score > b.score, "higher recall_count should boost score");
+        Ok(())
+    }
+
+    #[test]
+    fn test_recency_boosts_score() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.01).collect();
+
+        store.memorize("recent::a", "recently recalled", &[], &emb1)?;
+        store.memorize("recent::b", "never recalled", &[], &emb2)?;
+
+        // Recall a once to give it a recent last_recalled_at
+        store.recall(&emb1, 1, None)?;
+
+        // Query equidistant
+        let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
+        let results = store.recall(&mid, 2, None)?;
+        let a = results.iter().find(|m| m.mnemonic == "recent::a").unwrap();
+        let b = results.iter().find(|m| m.mnemonic == "recent::b").unwrap();
+        // a has recency + frequency boost, b has neither
+        assert!(a.score > b.score, "recently recalled memory should score higher");
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_boost_score() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        // a and c equidistant from query, b nearby; a is linked to b
+        let base: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb_a: Vec<f32> = base.iter().map(|x| x - 0.01).collect();
+        let emb_b: Vec<f32> = base.clone();
+        let emb_c: Vec<f32> = base.iter().map(|x| x + 0.01).collect();
+
+        store.memorize("linked::a", "content a", &[], &emb_a)?;
+        store.memorize("linked::b", "content b", &[], &emb_b)?;
+        store.memorize("linked::c", "content c", &[], &emb_c)?;
+
+        // Link a and b — both are candidates, so a gets link_boost from b's similarity
+        store.link("linked::a", "linked::b", "related")?;
+
+        let results = store.recall(&base, 3, None)?;
+        let a = results.iter().find(|m| m.mnemonic == "linked::a").unwrap();
+        let c = results.iter().find(|m| m.mnemonic == "linked::c").unwrap();
+        // a and c have symmetric distances from query, but a has link boost
+        assert!(a.score > c.score, "linked memory should score higher than equidistant unlinked");
+        Ok(())
+    }
+
+    #[test]
+    fn test_auto_merge_very_close_embeddings() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+
+        // Two embeddings within AUTO_MERGE_THRESHOLD (0.15)
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.0001).collect();
+
+        store.memorize("merge::old", "old content", &["tag_a".into()], &emb1)?;
+        store.memorize("merge::new", "new content", &["tag_b".into()], &emb2)?;
+
+        // Old should be merged into new
+        let results = store.recall(&emb1, 10, None)?;
+        let mnemonics: Vec<&str> = results.iter().map(|m| m.mnemonic.as_str()).collect();
+        assert!(
+            !mnemonics.contains(&"merge::old"),
+            "old memory should be deleted after auto-merge"
+        );
+        let new = results.iter().find(|m| m.mnemonic == "merge::new").unwrap();
+        assert!(
+            new.content.contains("new content") && new.content.contains("old content"),
+            "merged memory should contain both contents"
+        );
+        // Tags should be unioned
+        assert!(new.tags.contains(&"tag_a".to_string()));
+        assert!(new.tags.contains(&"tag_b".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manual_merge_preserves_content_and_links() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+        let emb3: Vec<f32> = vec![0.9; 384];
+
+        store.memorize("keep", "keep content", &["a".into()], &emb1)?;
+        store.memorize("discard", "discard content", &["b".into()], &emb2)?;
+        store.memorize("other", "other content", &[], &emb3)?;
+
+        // Link discard to other
+        store.link("discard", "other", "related")?;
+
+        store.merge("keep", "discard", &emb1)?;
+
+        // Discard should be gone
+        let results = store.recall(&emb2, 10, None)?;
+        assert!(
+            !results.iter().any(|m| m.mnemonic == "discard"),
+            "discard memory should be deleted"
+        );
+
+        // Keep should have merged content
+        let results = store.recall(&emb1, 10, None)?;
+        let kept = results.iter().find(|m| m.mnemonic == "keep").unwrap();
+        assert!(kept.content.contains("keep content"));
+        assert!(kept.content.contains("discard content"));
+        assert!(kept.tags.contains(&"a".to_string()));
+        assert!(kept.tags.contains(&"b".to_string()));
+
+        // Link from discard should have transferred to keep
+        let links = store.get_links("keep")?;
+        assert!(
+            links.iter().any(|l| l.target_mnemonic == "other" || l.source_mnemonic == "other"),
+            "links should transfer from discard to keep"
+        );
 
         Ok(())
     }

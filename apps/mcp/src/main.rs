@@ -37,6 +37,26 @@ struct RecallInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct MergeInput {
+    /// Mnemonic of the memory to keep
+    keep: String,
+    /// Mnemonic of the memory to absorb and delete
+    discard: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExportInput {
+    /// Directory to export memories to
+    directory: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ImportInput {
+    /// Directory to import memories from
+    directory: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct LinkInput {
     /// Mnemonic of the source memory
     source: String,
@@ -102,9 +122,10 @@ async fn main() -> Result<()> {
                 let mut output = String::new();
                 for (i, mem) in memories.iter().enumerate() {
                     output.push_str(&format!(
-                        "{}. [{}] (distance: {:.4}, recalled: {} times)\n{}\n",
+                        "{}. [{}] (score: {:.4}, distance: {:.4}, recalled: {} times)\n{}\n",
                         i + 1,
                         mem.mnemonic,
+                        mem.score,
                         mem.distance,
                         mem.recall_count,
                         mem.content,
@@ -153,12 +174,82 @@ async fn main() -> Result<()> {
         })
         .build();
 
+    let app = state.clone();
+    let merge = ToolBuilder::new("merge")
+        .description("Merge two memories: keep absorbs discard's content, tags, and links. The discard memory is deleted.")
+        .handler(move |input: MergeInput| {
+            let app = app.clone();
+            async move {
+                let embedding = app
+                    .embedder
+                    .lock()
+                    .await
+                    .embed(&input.keep)
+                    .tool_context("embedding failed")?;
+                app.store
+                    .lock()
+                    .await
+                    .merge(&input.keep, &input.discard, &embedding)
+                    .tool_context("merge failed")?;
+                Ok(CallToolResult::text(format!(
+                    "Merged: {} absorbed {}",
+                    input.keep, input.discard
+                )))
+            }
+        })
+        .build();
+
+    let app = state.clone();
+    let export = ToolBuilder::new("export")
+        .description("Export all memories to a directory as markdown files with YAML frontmatter.")
+        .handler(move |input: ExportInput| {
+            let app = app.clone();
+            async move {
+                let dir = std::path::Path::new(&input.directory);
+                app.store
+                    .lock()
+                    .await
+                    .export(dir)
+                    .tool_context("export failed")?;
+                Ok(CallToolResult::text(format!(
+                    "Exported to: {}",
+                    input.directory
+                )))
+            }
+        })
+        .build();
+
+    let app = state.clone();
+    let import = ToolBuilder::new("import")
+        .description("Import memories from a directory of markdown files with YAML frontmatter.")
+        .handler(move |input: ImportInput| {
+            let app = app.clone();
+            async move {
+                let dir = std::path::Path::new(&input.directory);
+                let embedder = app.embedder.lock().await;
+                let result = app
+                    .store
+                    .lock()
+                    .await
+                    .import(dir, &embedder)
+                    .tool_context("import failed")?;
+                Ok(CallToolResult::text(format!(
+                    "Imported: {} created, {} updated, {} unchanged",
+                    result.created, result.updated, result.unchanged
+                )))
+            }
+        })
+        .build();
+
     let router = McpRouter::new()
         .server_info("trivia", "0.1.0")
-        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity, and `link` to create explicit links between memories.")
+        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity, `link` to create explicit links between memories, `merge` to consolidate near-duplicate memories, `export` to save to files, and `import` to load from files.")
         .tool(memorize)
         .tool(recall)
-        .tool(link);
+        .tool(link)
+        .tool(merge)
+        .tool(export)
+        .tool(import);
 
     StdioTransport::new(router).run().await?;
     Ok(())
