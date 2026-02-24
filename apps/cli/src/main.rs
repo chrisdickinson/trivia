@@ -6,6 +6,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use trivia_core::{Embedder, MemoryStore};
 
+mod www;
+
 #[derive(Parser)]
 #[command(name = "trivia", about = "Semantic memory store")]
 struct Cli {
@@ -70,6 +72,12 @@ enum Command {
     Import {
         /// Source directory
         directory: String,
+    },
+    /// Start web UI server
+    Www {
+        /// Port to listen on
+        #[arg(long, short, default_value_t = 3000)]
+        port: u16,
     },
     /// Find and interactively merge similar memories
     Automerge {
@@ -197,6 +205,10 @@ fn main() -> Result<()> {
                 "Imported: {} created, {} updated, {} unchanged",
                 result.created, result.updated, result.unchanged
             );
+        }
+        Command::Www { port } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(www::serve(store, embedder, port))?;
         }
         Command::Automerge {
             threshold,

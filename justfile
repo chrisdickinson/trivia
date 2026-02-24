@@ -14,6 +14,17 @@ run:
 test:
 	cargo test --workspace
 
+www:
+	cargo run --bin trivia -- www
+
+vite:
+	npm run dev --prefix apps/cli/www
+
+#[parallel]
+dev: \
+		www \
+		vite
+
 [no-cd]
 claude *args:
 	claude --plugin-dir "{{ justfile_directory() }}" "$@"

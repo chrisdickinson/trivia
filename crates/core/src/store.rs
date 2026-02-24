@@ -686,6 +686,111 @@ impl MemoryStore {
 
         Ok(results)
     }
+
+    pub fn get_memory_by_mnemonic(&self, mnemonic: &str) -> Result<Option<Memory>> {
+        let row = self.conn.query_row(
+            "SELECT m.mnemonic, m.content, m.tags, m.updated_at, m.recall_count, m.last_recalled_at
+             FROM memories m
+             WHERE m.mnemonic = ?1",
+            params![mnemonic],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        );
+
+        match row {
+            Ok((mnemonic, content, tags_json, updated_at, recall_count, last_recalled_at)) => {
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                let links = self.get_links(&mnemonic)?;
+                Ok(Some(Memory {
+                    mnemonic,
+                    content,
+                    tags,
+                    distance: 0.0,
+                    score: 0.0,
+                    updated_at,
+                    recall_count,
+                    last_recalled_at,
+                    links,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn update_memory(
+        &self,
+        mnemonic: &str,
+        content: &str,
+        tags: &[String],
+        embedding: &[f32],
+    ) -> Result<()> {
+        let tags_json = serde_json::to_string(tags)?;
+        let tx = self.conn.unchecked_transaction()?;
+
+        let memory_id: i64 = tx
+            .query_row(
+                "SELECT id FROM memories WHERE mnemonic = ?1",
+                params![mnemonic],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("mnemonic not found: {}", mnemonic))?;
+
+        tx.execute(
+            "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![content, tags_json, memory_id],
+        )?;
+
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+            params![memory_id, embedding.as_bytes()],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_memory(&self, mnemonic: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM memories WHERE mnemonic = ?1",
+            params![mnemonic],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn get_all_links(&self) -> Result<Vec<MemoryLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.mnemonic, t.mnemonic, ml.link_type, ml.created_at
+             FROM memory_links ml
+             JOIN memories s ON s.id = ml.source_id
+             JOIN memories t ON t.id = ml.target_id",
+        )?;
+
+        let links = stmt
+            .query_map([], |row| {
+                Ok(MemoryLink {
+                    source_mnemonic: row.get(0)?,
+                    target_mnemonic: row.get(1)?,
+                    link_type: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(links)
+    }
 }
 
 /// Parse SQLite datetime strings and return days elapsed between them.
@@ -721,7 +826,7 @@ struct MemoryRow {
     last_recalled_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySummary {
     pub mnemonic: String,
     pub content: String,
@@ -729,7 +834,7 @@ pub struct MemorySummary {
     pub recall_count: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeCandidate {
     pub mnemonic: String,
     pub content: String,
