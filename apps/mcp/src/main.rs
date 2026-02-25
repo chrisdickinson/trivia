@@ -57,6 +57,14 @@ struct ImportInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct RateInput {
+    /// Mnemonic of the memory to rate
+    mnemonic: String,
+    /// Whether the memory was useful (true) or not useful (false)
+    useful: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct LinkInput {
     /// Mnemonic of the source memory
     source: String,
@@ -156,6 +164,26 @@ async fn main() -> Result<()> {
         .build();
 
     let app = state.clone();
+    let rate = ToolBuilder::new("rate")
+        .description("Rate a previously recalled memory as useful (true) or not useful (false). Call after using a recalled memory to improve future ranking.")
+        .handler(move |input: RateInput| {
+            let app = app.clone();
+            async move {
+                app.store
+                    .lock()
+                    .await
+                    .rate(&input.mnemonic, input.useful)
+                    .tool_context("rate failed")?;
+                let label = if input.useful { "useful" } else { "not useful" };
+                Ok(CallToolResult::text(format!(
+                    "Rated {} as {}",
+                    input.mnemonic, label
+                )))
+            }
+        })
+        .build();
+
+    let app = state.clone();
     let link = ToolBuilder::new("link")
         .description("Create a link between two memories. Link types: \"related\", \"supersedes\", \"derived_from\".")
         .handler(move |input: LinkInput| {
@@ -243,9 +271,10 @@ async fn main() -> Result<()> {
 
     let router = McpRouter::new()
         .server_info("trivia", "0.1.0")
-        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity, `link` to create explicit links between memories, `merge` to consolidate near-duplicate memories, `export` to save to files, and `import` to load from files.")
+        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity, `rate` to mark recalled memories as useful or not (improves future ranking), `link` to create explicit links between memories, `merge` to consolidate near-duplicate memories, `export` to save to files, and `import` to load from files.")
         .tool(memorize)
         .tool(recall)
+        .tool(rate)
         .tool(link)
         .tool(merge)
         .tool(export)

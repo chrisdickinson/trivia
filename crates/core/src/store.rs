@@ -19,6 +19,7 @@ pub struct ScoringConfig {
     pub recency_weight: f64,
     pub frequency_weight: f64,
     pub link_weight: f64,
+    pub rating_weight: f64,
     pub half_life_days: f64,
 }
 
@@ -29,6 +30,7 @@ impl Default for ScoringConfig {
             recency_weight: 0.1,
             frequency_weight: 0.05,
             link_weight: 0.1,
+            rating_weight: 0.15,
             half_life_days: 7.0,
         }
     }
@@ -51,6 +53,8 @@ pub struct Memory {
     pub updated_at: String,
     pub recall_count: i64,
     pub last_recalled_at: Option<String>,
+    pub useful_count: i64,
+    pub not_useful_count: i64,
     pub links: Vec<MemoryLink>,
 }
 
@@ -147,6 +151,8 @@ impl MemoryStore {
         add_column("ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;")?;
         add_column("ALTER TABLE memories ADD COLUMN last_recalled_at TEXT;")?;
         add_column("ALTER TABLE memories ADD COLUMN uuid TEXT;")?;
+        add_column("ALTER TABLE memories ADD COLUMN useful_count INTEGER NOT NULL DEFAULT 0;")?;
+        add_column("ALTER TABLE memories ADD COLUMN not_useful_count INTEGER NOT NULL DEFAULT 0;")?;
 
         // Backfill UUIDs for existing rows
         self.conn.execute_batch(
@@ -488,7 +494,7 @@ impl MemoryStore {
             None => base_fetch,
         };
 
-        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at, m.recall_count, m.last_recalled_at
+        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
              FROM memory_vectors v
              JOIN memories m ON m.id = v.memory_id
              WHERE v.embedding MATCH ?1
@@ -507,6 +513,8 @@ impl MemoryStore {
                     updated_at: row.get(4)?,
                     recall_count: row.get(5)?,
                     last_recalled_at: row.get(6)?,
+                    useful_count: row.get(7)?,
+                    not_useful_count: row.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -525,6 +533,8 @@ impl MemoryStore {
                     updated_at: row.updated_at,
                     recall_count: row.recall_count,
                     last_recalled_at: row.last_recalled_at,
+                    useful_count: row.useful_count,
+                    not_useful_count: row.not_useful_count,
                     links: Vec::new(),
                 }
             })
@@ -578,10 +588,22 @@ impl MemoryStore {
                 .take(3)
                 .sum();
 
+            let rating_signal = {
+                let total = (mem.useful_count + mem.not_useful_count) as f64;
+                if total > 0.0 {
+                    let ratio = (mem.useful_count - mem.not_useful_count) as f64 / total;
+                    let confidence = total.sqrt() / (total.sqrt() + 1.0);
+                    ratio * confidence
+                } else {
+                    0.0
+                }
+            };
+
             mem.score = self.scoring.similarity_weight * similarity
                 + self.scoring.recency_weight * recency
                 + self.scoring.frequency_weight * frequency
-                + self.scoring.link_weight * link_boost;
+                + self.scoring.link_weight * link_boost
+                + self.scoring.rating_weight * rating_signal;
         }
 
         // Sort by score descending, take limit
@@ -609,7 +631,7 @@ impl MemoryStore {
 
     pub fn list_all_summaries(&self) -> Result<Vec<MemorySummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT mnemonic, content, tags, recall_count
+            "SELECT mnemonic, content, tags, recall_count, useful_count, not_useful_count
              FROM memories
              ORDER BY recall_count DESC, updated_at DESC",
         )?;
@@ -621,17 +643,21 @@ impl MemoryStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(mnemonic, content, tags_json, recall_count)| {
+            .map(|(mnemonic, content, tags_json, recall_count, useful_count, not_useful_count)| {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                 MemorySummary {
                     mnemonic,
                     content,
                     tags,
                     recall_count,
+                    useful_count,
+                    not_useful_count,
                 }
             })
             .collect();
@@ -689,7 +715,7 @@ impl MemoryStore {
 
     pub fn get_memory_by_mnemonic(&self, mnemonic: &str) -> Result<Option<Memory>> {
         let row = self.conn.query_row(
-            "SELECT m.mnemonic, m.content, m.tags, m.updated_at, m.recall_count, m.last_recalled_at
+            "SELECT m.mnemonic, m.content, m.tags, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
              FROM memories m
              WHERE m.mnemonic = ?1",
             params![mnemonic],
@@ -701,12 +727,14 @@ impl MemoryStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         );
 
         match row {
-            Ok((mnemonic, content, tags_json, updated_at, recall_count, last_recalled_at)) => {
+            Ok((mnemonic, content, tags_json, updated_at, recall_count, last_recalled_at, useful_count, not_useful_count)) => {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                 let links = self.get_links(&mnemonic)?;
                 Ok(Some(Memory {
@@ -718,12 +746,32 @@ impl MemoryStore {
                     updated_at,
                     recall_count,
                     last_recalled_at,
+                    useful_count,
+                    not_useful_count,
                     links,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn rate(&self, mnemonic: &str, useful: bool) -> Result<()> {
+        let column = if useful {
+            "useful_count"
+        } else {
+            "not_useful_count"
+        };
+        let rows = self.conn.execute(
+            &format!(
+                "UPDATE memories SET {column} = {column} + 1 WHERE mnemonic = ?1"
+            ),
+            params![mnemonic],
+        )?;
+        if rows == 0 {
+            return Err(anyhow!("mnemonic not found: {}", mnemonic));
+        }
+        Ok(())
     }
 
     pub fn update_memory(
@@ -824,6 +872,8 @@ struct MemoryRow {
     updated_at: String,
     recall_count: i64,
     last_recalled_at: Option<String>,
+    useful_count: i64,
+    not_useful_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -832,6 +882,8 @@ pub struct MemorySummary {
     pub content: String,
     pub tags: Vec<String>,
     pub recall_count: i64,
+    pub useful_count: i64,
+    pub not_useful_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1186,6 +1238,52 @@ mod tests {
         assert!(new.tags.contains(&"tag_a".to_string()));
         assert!(new.tags.contains(&"tag_b".to_string()));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_useful() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        store.memorize("rated", "some content", &[], &emb)?;
+
+        store.rate("rated", true)?;
+        store.rate("rated", true)?;
+        store.rate("rated", false)?;
+
+        let mem = store.get_memory_by_mnemonic("rated")?.unwrap();
+        assert_eq!(mem.useful_count, 2);
+        assert_eq!(mem.not_useful_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_missing_mnemonic() {
+        let store = MemoryStore::in_memory().unwrap();
+        let result = store.rate("nonexistent", true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rating_affects_score() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.01).collect();
+
+        store.memorize("good", "well-rated memory", &[], &emb1)?;
+        store.memorize("bad", "poorly-rated memory", &[], &emb2)?;
+
+        // Rate good up, bad down
+        for _ in 0..5 {
+            store.rate("good", true)?;
+            store.rate("bad", false)?;
+        }
+
+        let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
+        let results = store.recall(&mid, 2, None)?;
+        let good = results.iter().find(|m| m.mnemonic == "good").unwrap();
+        let bad = results.iter().find(|m| m.mnemonic == "bad").unwrap();
+        assert!(good.score > bad.score, "well-rated memory should score higher");
         Ok(())
     }
 

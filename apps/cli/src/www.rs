@@ -44,6 +44,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, port: u16) -> Result<
 
     let api = Router::new()
         .route("/api/memories/merge", post(merge_memories))
+        .route("/api/memories/{mnemonic}/rate", post(rate_memory))
         .route("/api/memories", get(list_memories).post(create_memory))
         .route(
             "/api/memories/{mnemonic}",
@@ -136,6 +137,21 @@ async fn delete_memory(
     }
 }
 
+#[derive(Deserialize)]
+struct RateReq {
+    useful: bool,
+}
+
+async fn rate_memory(
+    State(state): State<Arc<AppState>>,
+    Path(mnemonic): Path<String>,
+    axum::Json(body): axum::Json<RateReq>,
+) -> AppResult<impl IntoResponse> {
+    let store = state.store.lock().await;
+    store.rate(&mnemonic, body.useful)?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
 #[derive(Serialize)]
 struct GraphResponse {
     nodes: Vec<GraphNode>,
@@ -148,6 +164,8 @@ struct GraphNode {
     content: String,
     tags: Vec<String>,
     recall_count: i64,
+    useful_count: i64,
+    not_useful_count: i64,
 }
 
 #[derive(Serialize)]
@@ -169,6 +187,8 @@ async fn get_graph(State(state): State<Arc<AppState>>) -> AppResult<impl IntoRes
             content: s.content,
             tags: s.tags,
             recall_count: s.recall_count,
+            useful_count: s.useful_count,
+            not_useful_count: s.not_useful_count,
         })
         .collect();
 

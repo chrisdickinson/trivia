@@ -63,6 +63,17 @@ enum Command {
         /// Mnemonic of the memory to absorb and delete
         discard: String,
     },
+    /// Rate a memory as useful or not useful
+    Rate {
+        /// Mnemonic of the memory to rate
+        mnemonic: String,
+        /// Mark as useful
+        #[arg(long, group = "rating")]
+        useful: bool,
+        /// Mark as not useful
+        #[arg(long, group = "rating")]
+        not_useful: bool,
+    },
     /// Export all memories to a directory as markdown files
     Export {
         /// Target directory
@@ -166,6 +177,18 @@ fn main() -> Result<()> {
                     println!();
                 }
             }
+        }
+        Command::Rate {
+            mnemonic,
+            useful,
+            not_useful,
+        } => {
+            if !useful && !not_useful {
+                anyhow::bail!("specify --useful or --not-useful");
+            }
+            store.rate(&mnemonic, useful)?;
+            let label = if useful { "useful" } else { "not useful" };
+            eprintln!("Rated {mnemonic} as {label}");
         }
         Command::Link {
             source,
@@ -282,7 +305,7 @@ fn main() -> Result<()> {
                 }
 
                 eprint!(
-                    "\n  {CYAN}{BOLD}[y]{RESET} merge  {CYAN}{BOLD}[s]{RESET} swap & merge  {CYAN}{BOLD}[n]{RESET} skip  {CYAN}{BOLD}[q]{RESET} quit  "
+                    "\n  {CYAN}{BOLD}[y]{RESET} merge  {CYAN}{BOLD}[s]{RESET} swap & merge  {CYAN}{BOLD}[l]{RESET} link  {CYAN}{BOLD}[n]{RESET} skip  {CYAN}{BOLD}[q]{RESET} quit  "
                 );
                 io::stderr().flush()?;
 
@@ -304,6 +327,10 @@ fn main() -> Result<()> {
                         discarded.insert(summary.mnemonic.clone());
                         merged_count += 1;
                         eprintln!("  {GREEN}Merged: {BOLD}{}{RESET}{GREEN} absorbed {}{RESET}", candidate.mnemonic, summary.mnemonic);
+                    }
+                    "l" | "link" => {
+                        store.link(&summary.mnemonic, &candidate.mnemonic, "related")?;
+                        eprintln!("  Linked: {} \u{2194} {}", summary.mnemonic, candidate.mnemonic);
                     }
                     "q" | "quit" => {
                         eprintln!("  {DIM}Quitting.{RESET}");
