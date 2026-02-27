@@ -1,2 +1,4 @@
 .fastembed_cache
 target
+bin/
+node_modules/

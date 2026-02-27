@@ -1,11 +1,12 @@
 use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use trivia_core::{Embedder, MemoryStore};
+use trivia_core::{Embedder, MemoryStore, TriviaConfig};
 
+mod mcp;
 mod www;
 
 #[derive(Parser)]
@@ -74,21 +75,32 @@ enum Command {
         #[arg(long, group = "rating")]
         not_useful: bool,
     },
-    /// Export all memories to a directory as markdown files
+    /// Export memories to a directory as markdown files
     Export {
         /// Target directory
         directory: String,
+        /// Only export memories with these tags
+        #[arg(long, short)]
+        tag: Vec<String>,
     },
     /// Import memories from a directory of markdown files
     Import {
         /// Source directory
         directory: String,
     },
+    /// Start MCP server (stdin/stdout JSON-RPC)
+    Mcp,
     /// Start web UI server
     Www {
         /// Port to listen on
         #[arg(long, short, default_value_t = 3000)]
         port: u16,
+    },
+    /// List all unique tags with memory counts
+    ListTags {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Find and interactively merge similar memories
     Automerge {
@@ -101,9 +113,11 @@ enum Command {
     },
 }
 
-fn db_path() -> PathBuf {
+fn db_path(config: &TriviaConfig) -> PathBuf {
     if let Ok(path) = std::env::var("TRIVIA_DB") {
         PathBuf::from(path)
+    } else if let Some(ref db) = config.database {
+        PathBuf::from(db)
     } else {
         dirs::home_dir()
             .expect("could not determine home directory")
@@ -112,9 +126,34 @@ fn db_path() -> PathBuf {
     }
 }
 
+fn load_config() -> TriviaConfig {
+    let start = std::env::var("CLAUDE_PLUGIN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    TriviaConfig::discover(&start)
+        .map(|(c, _)| c)
+        .unwrap_or_default()
+}
+
 fn main() -> Result<()> {
+    let config = load_config();
+
+    // Auto-detect: if stdin is not a TTY and no args, run MCP server
+    if !io::stdin().is_terminal() && std::env::args().count() == 1 {
+        let mut store = MemoryStore::new(&db_path(&config))?;
+        if !config.recall.tags.is_empty() {
+            store.set_boost_tags(config.recall.tags.clone());
+        }
+        let embedder = Embedder::new()?;
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(mcp::serve(store, embedder, config));
+    }
+
     let cli = Cli::parse();
-    let store = MemoryStore::new(&db_path())?;
+    let mut store = MemoryStore::new(&db_path(&config))?;
+    if !config.recall.tags.is_empty() {
+        store.set_boost_tags(config.recall.tags.clone());
+    }
     let embedder = Embedder::new()?;
 
     match cli.command {
@@ -123,8 +162,9 @@ fn main() -> Result<()> {
             content,
             tag,
         } => {
+            let tags = TriviaConfig::merge_tags(&config.memorize.tags, &tag);
             let embedding = embedder.embed(&mnemonic)?;
-            store.memorize(&mnemonic, &content, &tag, &embedding)?;
+            store.memorize(&mnemonic, &content, &tags, &embedding)?;
             eprintln!("Memorized: {mnemonic}");
         }
         Command::Recall {
@@ -139,7 +179,7 @@ fn main() -> Result<()> {
             } else {
                 Some(tag.as_slice())
             };
-            let memories = store.recall(&embedding, limit, tags)?;
+            let memories = store.recall(&embedding, limit, tags, None, None)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&memories)?);
@@ -148,13 +188,16 @@ fn main() -> Result<()> {
             } else {
                 for (i, mem) in memories.iter().enumerate() {
                     println!(
-                        "{}. [{}] (score: {:.4}, distance: {:.4}, recalled: {} times)\n{}",
+                        "{}. [{}] (score: {:.4})",
                         i + 1,
                         mem.mnemonic,
                         mem.score,
-                        mem.distance,
+                    );
+                    println!(
+                        "   created: {} | updated: {} | recalled: {} times",
+                        mem.created_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                        mem.updated_at.format("%Y-%m-%dT%H:%M:%SZ"),
                         mem.recall_count,
-                        mem.content,
                     );
                     if !mem.tags.is_empty() {
                         println!("   tags: {}", mem.tags.join(", "));
@@ -174,6 +217,8 @@ fn main() -> Result<()> {
                             .collect();
                         println!("   links: {}", link_strs.join(", "));
                     }
+                    println!();
+                    println!("{}", mem.content);
                     println!();
                 }
             }
@@ -216,9 +261,15 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Export { directory } => {
+        Command::Export { directory, tag } => {
             let dir = std::path::Path::new(&directory);
-            store.export(dir)?;
+            let merged = TriviaConfig::merge_tags(&config.export.tags, &tag);
+            let tags = if merged.is_empty() {
+                None
+            } else {
+                Some(merged.as_slice())
+            };
+            store.export(dir, tags)?;
             eprintln!("Exported to: {directory}");
         }
         Command::Import { directory } => {
@@ -229,9 +280,25 @@ fn main() -> Result<()> {
                 result.created, result.updated, result.unchanged
             );
         }
+        Command::Mcp => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(mcp::serve(store, embedder, config))?;
+        }
         Command::Www { port } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(www::serve(store, embedder, port))?;
+        }
+        Command::ListTags { json } => {
+            let tags = store.list_tags()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tags)?);
+            } else if tags.is_empty() {
+                println!("No tags found.");
+            } else {
+                for t in &tags {
+                    println!("{} ({} memories)", t.tag, t.count);
+                }
+            }
         }
         Command::Automerge {
             threshold,

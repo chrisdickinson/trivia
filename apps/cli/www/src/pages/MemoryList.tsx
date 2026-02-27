@@ -9,9 +9,17 @@ export function MemoryList() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [search, setSearch] = useState('')
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [showCreate, setShowCreate] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
+
+  const { data: allTags = [] } = useQuery({
+    queryKey: ['tags'],
+    queryFn: api.listTags,
+  })
+
+  const tagFilter = selectedTags.size > 0 ? [...selectedTags] : undefined
 
   const { data: memories = [], isLoading } = useQuery({
     queryKey: ['memories'],
@@ -19,10 +27,14 @@ export function MemoryList() {
   })
 
   const searchQuery = useQuery({
-    queryKey: ['search', search],
-    queryFn: () => api.search(search, 20),
+    queryKey: ['search', search, tagFilter],
+    queryFn: () => api.search(search, 20, tagFilter),
     enabled: search.length > 2,
   })
+
+  const filteredMemories = tagFilter
+    ? memories.filter(m => m.tags.some(t => selectedTags.has(t)))
+    : memories
 
   const items: MemorySummary[] = search.length > 2
     ? (searchQuery.data ?? []).map(m => ({
@@ -31,7 +43,16 @@ export function MemoryList() {
         tags: m.tags,
         recall_count: m.recall_count,
       }))
-    : memories
+    : filteredMemories
+
+  const toggleTag = (tag: string) => {
+    setSelectedTags(prev => {
+      const next = new Set(prev)
+      if (next.has(tag)) next.delete(tag)
+      else next.add(tag)
+      return next
+    })
+  }
 
   const toggleSelect = (mnemonic: string) => {
     setSelected(prev => {
@@ -69,6 +90,24 @@ export function MemoryList() {
           </button>
         )}
       </div>
+
+      {allTags.length > 0 && (
+        <div className="flex gap-1.5 flex-wrap mb-3">
+          {allTags.map(t => (
+            <button
+              key={t.tag}
+              onClick={() => toggleTag(t.tag)}
+              className={`px-2 py-0.5 rounded text-xs border transition-colors ${
+                selectedTags.has(t.tag)
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
+              }`}
+            >
+              {t.tag} <span className="opacity-60">({t.count})</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {isLoading ? (
         <p className="text-gray-500 text-sm">Loading...</p>

@@ -42,6 +42,11 @@ export interface GraphEdge {
   link_type: string
 }
 
+export interface TagCount {
+  tag: string
+  count: number
+}
+
 const enc = (s: string) => encodeURIComponent(s)
 
 async function json<T>(res: Response): Promise<T> {
@@ -66,19 +71,25 @@ export const api = {
       body: JSON.stringify({ mnemonic, content, tags }),
     }).then(r => json<{ ok: boolean }>(r)),
 
-  updateMemory: (mnemonic: string, content: string, tags: string[]) =>
+  updateMemory: (mnemonic: string, content: string, tags: string[], newMnemonic?: string) =>
     fetch(`/api/memories/${enc(mnemonic)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, tags }),
-    }).then(r => json<{ ok: boolean }>(r)),
+      body: JSON.stringify({ content, tags, ...(newMnemonic && newMnemonic !== mnemonic ? { mnemonic: newMnemonic } : {}) }),
+    }).then(r => json<{ ok: boolean; mnemonic?: string }>(r)),
 
   deleteMemory: (mnemonic: string) =>
     fetch(`/api/memories/${enc(mnemonic)}`, { method: 'DELETE' })
       .then(r => json<{ ok: boolean }>(r)),
 
-  search: (q: string, limit = 10) =>
-    fetch(`/api/search?q=${enc(q)}&limit=${limit}`).then(r => json<Memory[]>(r)),
+  search: (q: string, limit = 10, tags?: string[]) => {
+    const params = new URLSearchParams({ q, limit: String(limit) })
+    if (tags && tags.length > 0) params.set('tags', tags.join(','))
+    return fetch(`/api/search?${params}`).then(r => json<Memory[]>(r))
+  },
+
+  listTags: () =>
+    fetch('/api/tags').then(r => json<TagCount[]>(r)),
 
   getGraph: () =>
     fetch('/api/graph').then(r => json<GraphData>(r)),

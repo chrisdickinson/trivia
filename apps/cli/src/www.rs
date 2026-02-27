@@ -52,6 +52,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, port: u16) -> Result<
         )
         .route("/api/graph", get(get_graph))
         .route("/api/search", get(search_memories))
+        .route("/api/tags", get(list_tags))
         .route("/api/links", post(create_link).delete(remove_link));
 
     let app = api
@@ -109,19 +110,33 @@ struct UpdateMemoryReq {
     content: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// If set, rename the mnemonic
+    mnemonic: Option<String>,
 }
 
 async fn update_memory(
     State(state): State<Arc<AppState>>,
-    Path(mnemonic): Path<String>,
+    Path(old_mnemonic): Path<String>,
     axum::Json(body): axum::Json<UpdateMemoryReq>,
-) -> AppResult<impl IntoResponse> {
+) -> AppResult<Response> {
+    let new_mnemonic = body.mnemonic.as_deref().unwrap_or(&old_mnemonic);
+    let renaming = new_mnemonic != old_mnemonic;
+
     let embedder = state.embedder.lock().await;
-    let embedding = embedder.embed(&mnemonic)?;
+    let embedding = embedder.embed(new_mnemonic)?;
     drop(embedder);
+
     let store = state.store.lock().await;
-    store.update_memory(&mnemonic, &body.content, &body.tags, &embedding)?;
-    Ok(axum::Json(serde_json::json!({"ok": true})))
+    if renaming {
+        store.rename_memory(&old_mnemonic, new_mnemonic, &embedding)?;
+    }
+    store.update_memory(new_mnemonic, &body.content, &body.tags, &embedding)?;
+
+    if renaming {
+        Ok(axum::Json(serde_json::json!({"ok": true, "mnemonic": new_mnemonic})).into_response())
+    } else {
+        Ok(axum::Json(serde_json::json!({"ok": true})).into_response())
+    }
 }
 
 async fn delete_memory(
@@ -209,6 +224,9 @@ struct SearchQuery {
     q: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Comma-separated tag filter
+    #[serde(default)]
+    tags: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -222,9 +240,19 @@ async fn search_memories(
     let embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&params.q)?;
     drop(embedder);
+    let tag_list: Option<Vec<String>> = params
+        .tags
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
     let store = state.store.lock().await;
-    let results = store.recall(&embedding, params.limit, None)?;
+    let results = store.recall(&embedding, params.limit, tag_list.as_deref(), None, None)?;
     Ok(axum::Json(results))
+}
+
+async fn list_tags(State(state): State<Arc<AppState>>) -> AppResult<impl IntoResponse> {
+    let store = state.store.lock().await;
+    let tags = store.list_tags()?;
+    Ok(axum::Json(tags))
 }
 
 #[derive(Deserialize)]

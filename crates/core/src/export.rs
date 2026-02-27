@@ -71,25 +71,56 @@ struct ExportLinkRow {
 }
 
 impl MemoryStore {
-    pub fn export(&self, dir: &Path) -> Result<()> {
+    pub fn export(&self, dir: &Path, tags: Option<&[String]>) -> Result<()> {
         std::fs::create_dir_all(dir)?;
 
-        // Query all memories
-        let mut stmt = self
-            .conn()
-            .prepare("SELECT uuid, mnemonic, content, tags FROM memories ORDER BY mnemonic")?;
-        let rows: Vec<ExportRow> = stmt
-            .query_map([], |row| {
-                Ok(ExportRow {
-                    uuid: row.get(0)?,
-                    mnemonic: row.get(1)?,
-                    content: row.get(2)?,
-                    tags_json: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Query memories, optionally filtered by tags
+        let rows: Vec<ExportRow> = match tags {
+            Some(filter_tags) if !filter_tags.is_empty() => {
+                let placeholders: Vec<String> =
+                    (1..=filter_tags.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT DISTINCT m.uuid, m.mnemonic, m.content, m.tags
+                     FROM memories m, json_each(m.tags) je
+                     WHERE je.value IN ({})
+                     ORDER BY m.mnemonic",
+                    placeholders.join(", ")
+                );
+                let mut stmt = self.conn().prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::types::ToSql> = filter_tags
+                    .iter()
+                    .map(|t| t as &dyn rusqlite::types::ToSql)
+                    .collect();
+                stmt.query_map(params.as_slice(), |row| {
+                    Ok(ExportRow {
+                        uuid: row.get(0)?,
+                        mnemonic: row.get(1)?,
+                        content: row.get(2)?,
+                        tags_json: row.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            _ => {
+                let mut stmt = self.conn().prepare(
+                    "SELECT uuid, mnemonic, content, tags FROM memories ORDER BY mnemonic",
+                )?;
+                stmt.query_map([], |row| {
+                    Ok(ExportRow {
+                        uuid: row.get(0)?,
+                        mnemonic: row.get(1)?,
+                        content: row.get(2)?,
+                        tags_json: row.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+        };
 
-        // Query all links with UUIDs
+        // Query links — only include links where both ends are in the exported set
+        let exported_uuids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.uuid.as_str()).collect();
+
         let mut link_stmt = self.conn().prepare(
             "SELECT s_mem.uuid, t_mem.uuid, ml.link_type
              FROM memory_links ml
@@ -104,7 +135,13 @@ impl MemoryStore {
                     link_type: row.get(2)?,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|l| {
+                exported_uuids.contains(l.source_uuid.as_str())
+                    && exported_uuids.contains(l.target_uuid.as_str())
+            })
+            .collect();
 
         for row in &rows {
             let tags: Vec<String> = serde_json::from_str(&row.tags_json).unwrap_or_default();
@@ -303,7 +340,7 @@ mod tests {
         let store = make_store_with_data()?;
         let dir = TempDir::new()?;
 
-        store.export(dir.path())?;
+        store.export(dir.path(), None)?;
 
         let files: Vec<_> = std::fs::read_dir(dir.path())?
             .filter_map(|e| e.ok())
@@ -323,7 +360,7 @@ mod tests {
     fn test_export_import_roundtrip() -> Result<()> {
         let store = make_store_with_data()?;
         let dir = TempDir::new()?;
-        store.export(dir.path())?;
+        store.export(dir.path(), None)?;
 
         // Import into a fresh store
         let store2 = MemoryStore::in_memory()?;
@@ -345,7 +382,7 @@ mod tests {
     fn test_import_idempotent() -> Result<()> {
         let store = make_store_with_data()?;
         let dir = TempDir::new()?;
-        store.export(dir.path())?;
+        store.export(dir.path(), None)?;
 
         // Import twice into same store
         let store2 = MemoryStore::in_memory()?;

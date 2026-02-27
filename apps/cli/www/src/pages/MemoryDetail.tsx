@@ -17,6 +17,7 @@ export function MemoryDetail() {
   })
 
   const [editing, setEditing] = useState(false)
+  const [editMnemonic, setEditMnemonic] = useState('')
   const [content, setContent] = useState('')
   const [tagsStr, setTagsStr] = useState('')
   const [showDelete, setShowDelete] = useState(false)
@@ -24,6 +25,7 @@ export function MemoryDetail() {
 
   const startEdit = () => {
     if (!memory) return
+    setEditMnemonic(memory.mnemonic)
     setContent(memory.content)
     setTagsStr(memory.tags.join(', '))
     setEditing(true)
@@ -32,11 +34,15 @@ export function MemoryDetail() {
   const updateMutation = useMutation({
     mutationFn: () => {
       const tags = tagsStr.split(',').map(t => t.trim()).filter(Boolean)
-      return api.updateMemory(decodedMnemonic, content, tags)
+      return api.updateMemory(decodedMnemonic, content, tags, editMnemonic)
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       setEditing(false)
-      queryClient.invalidateQueries({ queryKey: ['memory', decodedMnemonic] })
+      if (data.mnemonic && data.mnemonic !== decodedMnemonic) {
+        navigate(`/memory/${encodeURIComponent(data.mnemonic)}`, { replace: true })
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['memory', decodedMnemonic] })
+      }
     },
   })
 
@@ -80,6 +86,13 @@ export function MemoryDetail() {
 
         {editing ? (
           <div className="space-y-3">
+            <input
+              type="text"
+              value={editMnemonic}
+              onChange={e => setEditMnemonic(e.target.value)}
+              placeholder="Mnemonic"
+              className="w-full border rounded-lg px-3 py-2 text-sm font-mono font-bold text-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
             <textarea
               value={content}
               onChange={e => setContent(e.target.value)}

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
 use serde::{Deserialize, Serialize};
 use sqlite_vec::sqlite3_vec_init;
@@ -21,6 +22,9 @@ pub struct ScoringConfig {
     pub link_weight: f64,
     pub rating_weight: f64,
     pub half_life_days: f64,
+    pub tag_boost_weight: f64,
+    pub fts_weight: f64,
+    pub boost_tags: Vec<String>,
 }
 
 impl Default for ScoringConfig {
@@ -32,6 +36,9 @@ impl Default for ScoringConfig {
             link_weight: 0.1,
             rating_weight: 0.15,
             half_life_days: 7.0,
+            tag_boost_weight: 0.2,
+            fts_weight: 0.5,
+            boost_tags: Vec::new(),
         }
     }
 }
@@ -50,9 +57,10 @@ pub struct Memory {
     pub tags: Vec<String>,
     pub distance: f64,
     pub score: f64,
-    pub updated_at: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub recall_count: i64,
-    pub last_recalled_at: Option<String>,
+    pub last_recalled_at: Option<DateTime<Utc>>,
     pub useful_count: i64,
     pub not_useful_count: i64,
     pub links: Vec<MemoryLink>,
@@ -63,7 +71,7 @@ pub struct MemoryLink {
     pub source_mnemonic: String,
     pub target_mnemonic: String,
     pub link_type: String,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct MemoryStore {
@@ -106,6 +114,10 @@ impl MemoryStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn set_boost_tags(&mut self, tags: Vec<String>) {
+        self.scoring.boost_tags = tags;
     }
 
     pub(crate) fn conn(&self) -> &Connection {
@@ -162,6 +174,53 @@ impl MemoryStore {
         self.conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_uuid ON memories(uuid);"
         )?;
+
+        // FTS5 index for full-text search on mnemonic + content
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                mnemonic,
+                content,
+                content='memories',
+                content_rowid='id',
+                tokenize='porter unicode61'
+            );
+
+            -- Sync triggers
+            CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memory_fts(rowid, mnemonic, content)
+                VALUES (new.id, new.mnemonic, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, mnemonic, content)
+                VALUES ('delete', old.id, old.mnemonic, old.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, mnemonic, content)
+                VALUES ('delete', old.id, old.mnemonic, old.content);
+                INSERT INTO memory_fts(rowid, mnemonic, content)
+                VALUES (new.id, new.mnemonic, new.content);
+            END;"
+        )?;
+
+        // Backfill FTS if empty (first run on existing DB)
+        let fts_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_fts",
+            [],
+            |row| row.get(0),
+        )?;
+        let mem_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories",
+            [],
+            |row| row.get(0),
+        )?;
+        if fts_count == 0 && mem_count > 0 {
+            self.conn.execute_batch(
+                "INSERT INTO memory_fts(rowid, mnemonic, content)
+                 SELECT id, mnemonic, content FROM memories;"
+            )?;
+        }
 
         Ok(())
     }
@@ -362,11 +421,12 @@ impl MemoryStore {
 
         let links = stmt
             .query_map(params![mnemonic], |row| {
+                let created_at_str: String = row.get(3)?;
                 Ok(MemoryLink {
                     source_mnemonic: row.get(0)?,
                     target_mnemonic: row.get(1)?,
                     link_type: row.get(2)?,
-                    created_at: row.get(3)?,
+                    created_at: parse_sqlite_datetime(&created_at_str),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -486,6 +546,8 @@ impl MemoryStore {
         query_embedding: &[f32],
         limit: usize,
         tags: Option<&[String]>,
+        fts_query: Option<&str>,
+        exclude_tags: Option<&[String]>,
     ) -> Result<Vec<Memory>> {
         // Overfetch 3x for composite scoring reranking
         let base_fetch = limit * 3;
@@ -494,7 +556,7 @@ impl MemoryStore {
             None => base_fetch,
         };
 
-        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
+        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
              FROM memory_vectors v
              JOIN memories m ON m.id = v.memory_id
              WHERE v.embedding MATCH ?1
@@ -510,14 +572,34 @@ impl MemoryStore {
                     content: row.get(1)?,
                     tags_json: row.get(2)?,
                     distance: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    recall_count: row.get(5)?,
-                    last_recalled_at: row.get(6)?,
-                    useful_count: row.get(7)?,
-                    not_useful_count: row.get(8)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    recall_count: row.get(6)?,
+                    last_recalled_at: row.get(7)?,
+                    useful_count: row.get(8)?,
+                    not_useful_count: row.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Build FTS match set if query provided
+        let fts_matches: std::collections::HashSet<String> = match fts_query {
+            Some(q) if !q.is_empty() => {
+                // Phrase-quote the query for FTS5
+                let escaped = q.replace('"', "\"\"");
+                let fts_sql = "SELECT m.mnemonic FROM memory_fts
+                     JOIN memories m ON m.id = memory_fts.rowid
+                     WHERE memory_fts MATCH ?1";
+                let mut fts_stmt = self.conn.prepare(fts_sql)?;
+                fts_stmt
+                    .query_map(params![format!("\"{}\"", escaped)], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+            _ => std::collections::HashSet::new(),
+        };
 
         let mut memories: Vec<Memory> = rows
             .into_iter()
@@ -530,9 +612,10 @@ impl MemoryStore {
                     tags: row_tags,
                     distance: row.distance,
                     score: 0.0,
-                    updated_at: row.updated_at,
+                    created_at: parse_sqlite_datetime(&row.created_at),
+                    updated_at: parse_sqlite_datetime(&row.updated_at),
                     recall_count: row.recall_count,
-                    last_recalled_at: row.last_recalled_at,
+                    last_recalled_at: row.last_recalled_at.as_deref().map(parse_sqlite_datetime),
                     useful_count: row.useful_count,
                     not_useful_count: row.not_useful_count,
                     links: Vec::new(),
@@ -540,6 +623,10 @@ impl MemoryStore {
             })
             .filter(|mem| match tags {
                 Some(filter_tags) => filter_tags.iter().any(|t| mem.tags.contains(t)),
+                None => true,
+            })
+            .filter(|mem| match exclude_tags {
+                Some(excl) => !excl.iter().any(|t| mem.tags.contains(t)),
                 None => true,
             })
             .collect();
@@ -556,16 +643,14 @@ impl MemoryStore {
             .map(|m| (m.mnemonic.clone(), 1.0 - m.distance))
             .collect();
         let lambda = (2.0_f64).ln() / self.scoring.half_life_days;
-        let now = self
-            .conn
-            .query_row("SELECT datetime('now')", [], |row| row.get::<_, String>(0))?;
+        let now = Utc::now();
 
         for mem in &mut memories {
             let similarity = 1.0 - mem.distance;
 
-            let recency = match &mem.last_recalled_at {
+            let recency = match mem.last_recalled_at {
                 Some(ts) => {
-                    let days = days_between(ts, &now);
+                    let days = days_between(ts, now);
                     (-lambda * days).exp()
                 }
                 None => 0.0,
@@ -599,11 +684,30 @@ impl MemoryStore {
                 }
             };
 
+            let tag_boost = if !self.scoring.boost_tags.is_empty() {
+                let matches = mem
+                    .tags
+                    .iter()
+                    .filter(|t| self.scoring.boost_tags.contains(t))
+                    .count();
+                (matches as f64) / (self.scoring.boost_tags.len() as f64)
+            } else {
+                0.0
+            };
+
+            let fts_boost = if fts_matches.contains(&mem.mnemonic) {
+                1.0
+            } else {
+                0.0
+            };
+
             mem.score = self.scoring.similarity_weight * similarity
                 + self.scoring.recency_weight * recency
                 + self.scoring.frequency_weight * frequency
                 + self.scoring.link_weight * link_boost
-                + self.scoring.rating_weight * rating_signal;
+                + self.scoring.rating_weight * rating_signal
+                + self.scoring.tag_boost_weight * tag_boost
+                + self.scoring.fts_weight * fts_boost;
         }
 
         // Sort by score descending, take limit
@@ -715,7 +819,7 @@ impl MemoryStore {
 
     pub fn get_memory_by_mnemonic(&self, mnemonic: &str) -> Result<Option<Memory>> {
         let row = self.conn.query_row(
-            "SELECT m.mnemonic, m.content, m.tags, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
+            "SELECT m.mnemonic, m.content, m.tags, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
              FROM memories m
              WHERE m.mnemonic = ?1",
             params![mnemonic],
@@ -725,16 +829,17 @@ impl MemoryStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         );
 
         match row {
-            Ok((mnemonic, content, tags_json, updated_at, recall_count, last_recalled_at, useful_count, not_useful_count)) => {
+            Ok((mnemonic, content, tags_json, created_at, updated_at, recall_count, last_recalled_at, useful_count, not_useful_count)) => {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                 let links = self.get_links(&mnemonic)?;
                 Ok(Some(Memory {
@@ -743,9 +848,10 @@ impl MemoryStore {
                     tags,
                     distance: 0.0,
                     score: 0.0,
-                    updated_at,
+                    created_at: parse_sqlite_datetime(&created_at),
+                    updated_at: parse_sqlite_datetime(&updated_at),
                     recall_count,
-                    last_recalled_at,
+                    last_recalled_at: last_recalled_at.as_deref().map(parse_sqlite_datetime),
                     useful_count,
                     not_useful_count,
                     links,
@@ -772,6 +878,28 @@ impl MemoryStore {
             return Err(anyhow!("mnemonic not found: {}", mnemonic));
         }
         Ok(())
+    }
+
+    /// Rate multiple memories at once. Returns the list of mnemonics that were NOT found.
+    pub fn rate_batch(&self, mnemonics: &[String], useful: bool) -> Result<Vec<String>> {
+        let column = if useful {
+            "useful_count"
+        } else {
+            "not_useful_count"
+        };
+        let mut not_found = Vec::new();
+        for mnemonic in mnemonics {
+            let rows = self.conn.execute(
+                &format!(
+                    "UPDATE memories SET {column} = {column} + 1 WHERE mnemonic = ?1"
+                ),
+                params![mnemonic],
+            )?;
+            if rows == 0 {
+                not_found.push(mnemonic.clone());
+            }
+        }
+        Ok(not_found)
     }
 
     pub fn update_memory(
@@ -810,12 +938,83 @@ impl MemoryStore {
         Ok(())
     }
 
+    pub fn rename_memory(
+        &self,
+        old_mnemonic: &str,
+        new_mnemonic: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let memory_id: i64 = tx
+            .query_row(
+                "SELECT id FROM memories WHERE mnemonic = ?1",
+                params![old_mnemonic],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("mnemonic not found: {}", old_mnemonic))?;
+
+        // Check for conflict
+        let conflict: bool = tx
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE mnemonic = ?1 AND id != ?2",
+                params![new_mnemonic, memory_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
+
+        if conflict {
+            return Err(anyhow!(
+                "mnemonic already exists: {}",
+                new_mnemonic
+            ));
+        }
+
+        tx.execute(
+            "UPDATE memories SET mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![new_mnemonic, memory_id],
+        )?;
+
+        // Re-embed with new mnemonic
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+            params![memory_id, embedding.as_bytes()],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_memory(&self, mnemonic: &str) -> Result<bool> {
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE mnemonic = ?1",
             params![mnemonic],
         )?;
         Ok(rows > 0)
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<TagCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT json_each.value AS tag, COUNT(*) AS count
+             FROM memories, json_each(memories.tags)
+             GROUP BY tag
+             ORDER BY count DESC, tag ASC",
+        )?;
+
+        let results = stmt
+            .query_map([], |row| {
+                Ok(TagCount {
+                    tag: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(results)
     }
 
     pub fn get_all_links(&self) -> Result<Vec<MemoryLink>> {
@@ -828,11 +1027,12 @@ impl MemoryStore {
 
         let links = stmt
             .query_map([], |row| {
+                let created_at_str: String = row.get(3)?;
                 Ok(MemoryLink {
                     source_mnemonic: row.get(0)?,
                     target_mnemonic: row.get(1)?,
                     link_type: row.get(2)?,
-                    created_at: row.get(3)?,
+                    created_at: parse_sqlite_datetime(&created_at_str),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -841,27 +1041,17 @@ impl MemoryStore {
     }
 }
 
-/// Parse SQLite datetime strings and return days elapsed between them.
-fn days_between(earlier: &str, later: &str) -> f64 {
-    // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
-    fn parse_timestamp(s: &str) -> Option<f64> {
-        let parts: Vec<&str> = s.split(|c| c == '-' || c == ' ' || c == ':').collect();
-        if parts.len() < 6 {
-            return None;
-        }
-        let year: f64 = parts[0].parse().ok()?;
-        let month: f64 = parts[1].parse().ok()?;
-        let day: f64 = parts[2].parse().ok()?;
-        let hour: f64 = parts[3].parse().ok()?;
-        let min: f64 = parts[4].parse().ok()?;
-        let sec: f64 = parts[5].parse().ok()?;
-        // Approximate days since epoch (good enough for deltas)
-        Some(year * 365.25 + month * 30.44 + day + (hour + min / 60.0 + sec / 3600.0) / 24.0)
-    }
-    match (parse_timestamp(earlier), parse_timestamp(later)) {
-        (Some(e), Some(l)) => (l - e).max(0.0),
-        _ => 0.0,
-    }
+/// Parse a SQLite datetime string ("YYYY-MM-DD HH:MM:SS") into a chrono DateTime<Utc>.
+fn parse_sqlite_datetime(s: &str) -> DateTime<Utc> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
+        .unwrap_or_default()
+}
+
+/// Return the number of days between two DateTimes.
+fn days_between(earlier: DateTime<Utc>, later: DateTime<Utc>) -> f64 {
+    let duration = later.signed_duration_since(earlier);
+    (duration.num_seconds() as f64 / 86400.0).max(0.0)
 }
 
 struct MemoryRow {
@@ -869,6 +1059,7 @@ struct MemoryRow {
     content: String,
     tags_json: String,
     distance: f64,
+    created_at: String,
     updated_at: String,
     recall_count: i64,
     last_recalled_at: Option<String>,
@@ -884,6 +1075,12 @@ pub struct MemorySummary {
     pub recall_count: i64,
     pub useful_count: i64,
     pub not_useful_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -916,7 +1113,7 @@ mod tests {
             &emb2,
         )?;
 
-        let results = store.recall(&query, 5, None)?;
+        let results = store.recall(&query, 5, None, None, None)?;
         assert_eq!(results.len(), 2);
 
         // Both should be returned, closest first
@@ -940,7 +1137,7 @@ mod tests {
         store.memorize("key", "original content", &[], &emb)?;
         store.memorize("key", "updated content", &[], &emb2)?;
 
-        let results = store.recall(&emb2, 5, None)?;
+        let results = store.recall(&emb2, 5, None, None, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "updated content");
 
@@ -955,18 +1152,18 @@ mod tests {
         store.memorize("tracked::fact", "some content", &[], &emb)?;
 
         // First recall — returned snapshot has count=0 (pre-update value)
-        let results = store.recall(&emb, 5, None)?;
+        let results = store.recall(&emb, 5, None, None, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].recall_count, 0);
         assert!(results[0].last_recalled_at.is_none());
 
         // Second recall — DB was updated by the first recall, so now count=1
-        let results = store.recall(&emb, 5, None)?;
+        let results = store.recall(&emb, 5, None, None, None)?;
         assert_eq!(results[0].recall_count, 1);
         assert!(results[0].last_recalled_at.is_some());
 
         // Third recall — count should be 2
-        let results = store.recall(&emb, 5, None)?;
+        let results = store.recall(&emb, 5, None, None, None)?;
         assert_eq!(results[0].recall_count, 2);
         assert!(results[0].last_recalled_at.is_some());
 
@@ -1121,7 +1318,7 @@ mod tests {
         store.memorize("r2", "other memory", &[], &emb2)?;
         store.link("r1", "r2", "supersedes")?;
 
-        let results = store.recall(&emb1, 5, None)?;
+        let results = store.recall(&emb1, 5, None, None, None)?;
         let r1 = results.iter().find(|m| m.mnemonic == "r1").unwrap();
         assert!(!r1.links.is_empty(), "recalled memory should include links");
 
@@ -1134,7 +1331,7 @@ mod tests {
         let emb: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
         store.memorize("scored", "content", &[], &emb)?;
 
-        let results = store.recall(&emb, 5, None)?;
+        let results = store.recall(&emb, 5, None, None, None)?;
         assert_eq!(results.len(), 1);
         assert!(results[0].score > 0.0, "score should be positive for close match");
         Ok(())
@@ -1151,12 +1348,12 @@ mod tests {
 
         // Recall several times to boost freq::a's recall_count
         for _ in 0..5 {
-            store.recall(&emb1, 1, None)?;
+            store.recall(&emb1, 1, None, None, None)?;
         }
 
         // Query equidistant — freq::a should score higher due to frequency
         let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
-        let results = store.recall(&mid, 2, None)?;
+        let results = store.recall(&mid, 2, None, None, None)?;
         assert_eq!(results.len(), 2);
 
         let a = results.iter().find(|m| m.mnemonic == "freq::a").unwrap();
@@ -1175,11 +1372,11 @@ mod tests {
         store.memorize("recent::b", "never recalled", &[], &emb2)?;
 
         // Recall a once to give it a recent last_recalled_at
-        store.recall(&emb1, 1, None)?;
+        store.recall(&emb1, 1, None, None, None)?;
 
         // Query equidistant
         let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
-        let results = store.recall(&mid, 2, None)?;
+        let results = store.recall(&mid, 2, None, None, None)?;
         let a = results.iter().find(|m| m.mnemonic == "recent::a").unwrap();
         let b = results.iter().find(|m| m.mnemonic == "recent::b").unwrap();
         // a has recency + frequency boost, b has neither
@@ -1203,7 +1400,7 @@ mod tests {
         // Link a and b — both are candidates, so a gets link_boost from b's similarity
         store.link("linked::a", "linked::b", "related")?;
 
-        let results = store.recall(&base, 3, None)?;
+        let results = store.recall(&base, 3, None, None, None)?;
         let a = results.iter().find(|m| m.mnemonic == "linked::a").unwrap();
         let c = results.iter().find(|m| m.mnemonic == "linked::c").unwrap();
         // a and c have symmetric distances from query, but a has link boost
@@ -1223,7 +1420,7 @@ mod tests {
         store.memorize("merge::new", "new content", &["tag_b".into()], &emb2)?;
 
         // Old should be merged into new
-        let results = store.recall(&emb1, 10, None)?;
+        let results = store.recall(&emb1, 10, None, None, None)?;
         let mnemonics: Vec<&str> = results.iter().map(|m| m.mnemonic.as_str()).collect();
         assert!(
             !mnemonics.contains(&"merge::old"),
@@ -1280,7 +1477,7 @@ mod tests {
         }
 
         let mid: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.005).collect();
-        let results = store.recall(&mid, 2, None)?;
+        let results = store.recall(&mid, 2, None, None, None)?;
         let good = results.iter().find(|m| m.mnemonic == "good").unwrap();
         let bad = results.iter().find(|m| m.mnemonic == "bad").unwrap();
         assert!(good.score > bad.score, "well-rated memory should score higher");
@@ -1304,14 +1501,14 @@ mod tests {
         store.merge("keep", "discard", &emb1)?;
 
         // Discard should be gone
-        let results = store.recall(&emb2, 10, None)?;
+        let results = store.recall(&emb2, 10, None, None, None)?;
         assert!(
             !results.iter().any(|m| m.mnemonic == "discard"),
             "discard memory should be deleted"
         );
 
         // Keep should have merged content
-        let results = store.recall(&emb1, 10, None)?;
+        let results = store.recall(&emb1, 10, None, None, None)?;
         let kept = results.iter().find(|m| m.mnemonic == "keep").unwrap();
         assert!(kept.content.contains("keep content"));
         assert!(kept.content.contains("discard content"));

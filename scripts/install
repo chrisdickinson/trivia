@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+BIN_DIR="${PLUGIN_ROOT}/bin"
+BIN="${BIN_DIR}/trivia"
+
+# If binary already exists and is executable, we're done
+if [ -x "$BIN" ]; then
+  exit 0
+fi
+
+mkdir -p "$BIN_DIR"
+
+# Detect platform
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+
+case "$ARCH" in
+  x86_64)  ARCH="x86_64" ;;
+  aarch64|arm64) ARCH="aarch64" ;;
+  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+case "$OS" in
+  linux)  TARGET="${ARCH}-unknown-linux-gnu" ;;
+  darwin) TARGET="${ARCH}-apple-darwin" ;;
+  *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
+esac
+
+# Try downloading from GitHub releases
+REPO="chrisdickinson/trivia"
+RELEASE_URL="https://github.com/${REPO}/releases/latest/download/trivia-${TARGET}.tar.gz"
+
+if command -v curl &>/dev/null; then
+  HTTP_CODE=$(curl -sL -o /tmp/trivia-release.tar.gz -w "%{http_code}" "$RELEASE_URL" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ]; then
+    tar -xzf /tmp/trivia-release.tar.gz -C "$BIN_DIR"
+    chmod +x "$BIN"
+    rm -f /tmp/trivia-release.tar.gz
+    exit 0
+  fi
+  rm -f /tmp/trivia-release.tar.gz
+fi
+
+# Fallback: build from source
+if command -v cargo &>/dev/null; then
+  echo "Building trivia from source..." >&2
+
+  # Build web UI if npm is available and dist doesn't exist
+  WWW_DIR="${PLUGIN_ROOT}/apps/cli/www"
+  if [ ! -d "${WWW_DIR}/dist" ] && command -v npm &>/dev/null; then
+    (cd "$WWW_DIR" && npm ci && npm run build) >&2
+  fi
+
+  cargo build --manifest-path "${PLUGIN_ROOT}/apps/cli/Cargo.toml" --release --quiet
+  cp "${PLUGIN_ROOT}/target/release/trivia" "$BIN"
+  chmod +x "$BIN"
+  exit 0
+fi
+
+echo "Error: could not install trivia. Install cargo or download a release." >&2
+exit 1
