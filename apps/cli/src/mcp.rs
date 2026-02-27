@@ -323,7 +323,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
     let app = state.clone();
     let list_tags = ToolBuilder::new("list-tags")
         .description("List all unique tags with the number of memories using each tag.")
-        .handler(move |_input: Option<()>| {
+        .no_params_handler(move || {
             let app = app.clone();
             async move {
                 let tags = app
@@ -360,4 +360,19 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     StdioTransport::new(router).run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use schemars::schema_for;
+    use tower_mcp::NoParams;
+
+    #[test]
+    fn no_params_schema_is_valid_mcp_object() {
+        let schema = schema_for!(NoParams);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["type"], "object");
+        // MCP requires "type": "object", not "type": "null"
+        assert_ne!(value["type"], "null");
+    }
 }
