@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tower_mcp::error::ResultExt;
 use tower_mcp::transport::stdio::StdioTransport;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
-use trivia_core::{Embedder, Memory, MemoryStore, TriviaConfig};
+use trivia_core::{Embedder, Memory, MemoryStore, MemorizeResult, TriviaConfig};
 
 struct AppState {
     store: Mutex<MemoryStore>,
@@ -28,7 +28,7 @@ struct MemorizeInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RecallInput {
-    /// Natural language search query
+    /// Natural language query — matched by meaning, not keywords. Describe what you're looking for.
     query: String,
     /// Maximum number of results (default: 5, max: 10)
     limit: Option<usize>,
@@ -50,6 +50,28 @@ struct MergeInput {
     keep: String,
     /// Mnemonic of the memory to absorb and delete
     discard: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EditInput {
+    /// Current mnemonic of the memory to edit
+    mnemonic: String,
+    /// New mnemonic (will re-embed the memory)
+    new_mnemonic: Option<String>,
+    /// Tags to add
+    #[serde(default)]
+    add_tags: Vec<String>,
+    /// Tags to remove
+    #[serde(default)]
+    remove_tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameTagInput {
+    /// Current tag name
+    old_tag: String,
+    /// New tag name
+    new_tag: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -85,6 +107,52 @@ struct LinkInput {
     target: String,
     /// Type of link: "related", "supersedes", or "derived_from"
     link_type: String,
+}
+
+fn format_memorize_response(mnemonic: &str, result: &MemorizeResult) -> String {
+    let mut output = if let Some(ref merged) = result.merged_with {
+        format!("Memorized and merged with: {merged}")
+    } else {
+        format!("Memorized: {mnemonic}")
+    };
+
+    if !result.neighbors.is_empty() {
+        output.push_str("\n\nNearby memories:");
+        for n in &result.neighbors {
+            let tags_str = if n.tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tags: [{}]", n.tags.join(", "))
+            };
+            output.push_str(&format!(
+                "\n  - \"{}\" (distance: {:.2}{tags_str})",
+                n.mnemonic, n.distance
+            ));
+        }
+
+        // Warn about very close neighbors
+        let close: Vec<&trivia_core::MemorizeNeighbor> = result
+            .neighbors
+            .iter()
+            .filter(|n| n.distance < 0.22)
+            .collect();
+        if !close.is_empty() {
+            output.push_str("\n\nNote: ");
+            for (i, n) in close.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&format!("\"{}\" (distance {:.2})", n.mnemonic, n.distance));
+            }
+            let verb = if close.len() == 1 { "is" } else { "are" };
+            output.push_str(&format!(
+                " {verb} fairly close. If these memories compete in future recalls, \
+                 consider using `edit` to disambiguate their mnemonics.",
+            ));
+        }
+    }
+
+    output
 }
 
 fn format_memories(memories: &[Memory], truncate: Option<usize>) -> String {
@@ -149,24 +217,24 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let app = state.clone();
     let memorize = ToolBuilder::new("memorize")
-        .description("Store a fact or context for later recall. Use a mnemonic (file path, concept, phrase) plus the content to remember. Good examples include \"project design\"; \"feedback on src/files/foo.rs\"; \"implementation of the Frobnicator Component\". You're looking to capture what the memory was about with the mnemonic rather than the content of the memory.")
+        .description("Store a fact or context for later recall. Use a mnemonic (file path, concept, phrase) plus the content to remember. Good examples include \"project design\"; \"feedback on src/files/foo.rs\"; \"implementation of the Frobnicator Component\". You're looking to capture what the memory was about with the mnemonic rather than the content of the memory. Mnemonics that are very similar to existing ones may be auto-merged. The response will note nearby memories and warn about close collisions.")
         .handler(move |input: MemorizeInput| {
             let app = app.clone();
             async move {
                 let tags = TriviaConfig::merge_tags(&app.config.memorize.tags, &input.tags);
                 let embedding = app.embedder.lock().await.embed(&input.mnemonic)
                     .tool_context("embedding failed")?;
-                app.store.lock().await
+                let result = app.store.lock().await
                     .memorize(&input.mnemonic, &input.content, &tags, &embedding)
                     .tool_context("memorize failed")?;
-                Ok(CallToolResult::text(format!("Memorized: {}", input.mnemonic)))
+                Ok(CallToolResult::text(format_memorize_response(&input.mnemonic, &result)))
             }
         })
         .build();
 
     let app = state.clone();
     let recall = ToolBuilder::new("recall")
-        .description("Retrieve previously memorized facts by semantic similarity. Provide a natural language query describing what you're looking for. Use full_text_search to boost results containing specific keywords. Use min_score to filter low-relevance results. Use exclude_tags to hide irrelevant categories.")
+        .description("Retrieve previously memorized facts by semantic similarity. Provide a natural language query describing what you're looking for. Use `full_text_search` alongside it to boost results that contain a specific keyword or phrase — this is useful when you know the exact term but want semantic ranking too. Use min_score to filter low-relevance results. Use exclude_tags to hide irrelevant categories.")
         .handler(move |input: RecallInput| {
             let app = app.clone();
             async move {
@@ -198,7 +266,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let app = state.clone();
     let rate = ToolBuilder::new("rate")
-        .description("Rate previously recalled memories as useful or not useful. Accepts a single mnemonic or a batch of mnemonics. Silent on complete success; reports only not-found mnemonics.")
+        .description("Rate previously recalled memories as useful or not useful. Call this after using recalled memories to improve future ranking. Accepts a single mnemonic or a batch of mnemonics. Silent on complete success; reports only not-found mnemonics.")
         .handler(move |input: RateInput| {
             let app = app.clone();
             async move {
@@ -235,7 +303,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let app = state.clone();
     let link = ToolBuilder::new("link")
-        .description("Create a link between two memories. Link types: \"related\", \"supersedes\", \"derived_from\".")
+        .description("Create a link between two memories. Link types: \"related\" (topically connected), \"supersedes\" (source replaces target — used after corrections or updates), \"derived_from\" (source was created based on target).")
         .handler(move |input: LinkInput| {
             let app = app.clone();
             async move {
@@ -254,7 +322,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let app = state.clone();
     let merge = ToolBuilder::new("merge")
-        .description("Merge two memories: keep absorbs discard's content, tags, and links. The discard memory is deleted.")
+        .description("Merge two memories: keep absorbs discard's content, tags, and links. The discard memory is deleted. Use when two memories cover the same topic and should be one entry. Prefer `link` over merge when memories are related but distinct.")
         .handler(move |input: MergeInput| {
             let app = app.clone();
             async move {
@@ -346,14 +414,73 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         })
         .build();
 
+    let app = state.clone();
+    let edit = ToolBuilder::new("edit")
+        .description("Edit an existing memory's mnemonic or tags. Use to disambiguate colliding mnemonics or fix tag assignments. If the mnemonic is changed, the memory will be re-embedded.")
+        .handler(move |input: EditInput| {
+            let app = app.clone();
+            async move {
+                if input.new_mnemonic.is_none() && input.add_tags.is_empty() && input.remove_tags.is_empty() {
+                    return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags"))
+                        .tool_context("edit failed");
+                }
+                let new_embedding = match &input.new_mnemonic {
+                    Some(mn) => Some(
+                        app.embedder.lock().await.embed(mn)
+                            .tool_context("embedding failed")?
+                    ),
+                    None => None,
+                };
+                let result = app.store.lock().await
+                    .edit_memory(
+                        &input.mnemonic,
+                        input.new_mnemonic.as_deref(),
+                        &input.add_tags,
+                        &input.remove_tags,
+                        new_embedding.as_deref(),
+                    )
+                    .tool_context("edit failed")?;
+
+                let mut output = if result.re_embedded {
+                    format!("Renamed: \"{}\" -> \"{}\"", result.old_mnemonic, result.new_mnemonic)
+                } else {
+                    format!("Updated: \"{}\"", result.old_mnemonic)
+                };
+                if !result.tags.is_empty() {
+                    output.push_str(&format!("\nTags: [{}]", result.tags.join(", ")));
+                }
+                Ok(CallToolResult::text(output))
+            }
+        })
+        .build();
+
+    let app = state.clone();
+    let rename_tag = ToolBuilder::new("rename-tag")
+        .description("Rename a tag across all memories. No re-embedding needed.")
+        .handler(move |input: RenameTagInput| {
+            let app = app.clone();
+            async move {
+                let count = app.store.lock().await
+                    .rename_tag(&input.old_tag, &input.new_tag)
+                    .tool_context("rename-tag failed")?;
+                Ok(CallToolResult::text(format!(
+                    "Renamed tag \"{}\" -> \"{}\" across {count} memories",
+                    input.old_tag, input.new_tag
+                )))
+            }
+        })
+        .build();
+
     let router = McpRouter::new()
         .server_info("trivia", "0.1.0")
-        .instructions("Semantic memory store. Use `memorize` to save facts with a mnemonic identifier, `recall` to retrieve them by semantic similarity (supports `full_text_search` for keyword boosting, `min_score` for relevance filtering, `exclude_tags` to hide categories, and `truncate` for body length), `rate` to mark recalled memories as useful or not (accepts batch via `mnemonics` array), `link` to create explicit links between memories, `merge` to consolidate near-duplicate memories, `export` to save to files, `import` to load from files, and `list-tags` to see all tags.")
+        .instructions("Semantic memory store. Memories are keyed by a short mnemonic (a concept name, file path, or phrase) and hold longer-form content. The mnemonic is what gets embedded for vector search; content is searched via full-text keyword match.\n\nTypical workflow: `recall` before starting work to load relevant context, `memorize` to save new facts, `rate` results after using them so ranking improves over time. Very similar mnemonics are auto-merged on memorize (distance < 0.15) and auto-linked (distance < 0.30).\n\nUse `edit` to rename mnemonics that collide in recall. Use `merge` when two memories cover the same topic. Use `link` to create explicit relationships between distinct memories.")
         .tool(memorize)
         .tool(recall)
         .tool(rate)
         .tool(link)
         .tool(merge)
+        .tool(edit)
+        .tool(rename_tag)
         .tool(export)
         .tool(import)
         .tool(list_tags);

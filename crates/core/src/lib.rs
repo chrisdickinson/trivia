@@ -7,5 +7,6 @@ pub use config::TriviaConfig;
 pub use embedder::Embedder;
 pub use export::ImportResult;
 pub use store::{
-    Memory, MemoryLink, MemoryStore, MergeCandidate, MemorySummary, ScoringConfig, TagCount,
+    EditResult, Memory, MemoryLink, MemoryStore, MemorizeNeighbor, MemorizeResult,
+    MergeCandidate, MemorySummary, ScoringConfig, TagCount,
 };

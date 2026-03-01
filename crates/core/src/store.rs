@@ -231,7 +231,7 @@ impl MemoryStore {
         content: &str,
         tags: &[String],
         embedding: &[f32],
-    ) -> Result<()> {
+    ) -> Result<MemorizeResult> {
         let tags_json = serde_json::to_string(tags)?;
 
         let tx = self.conn.unchecked_transaction()?;
@@ -265,27 +265,42 @@ impl MemoryStore {
         )?;
 
         // After inserting the vector, find nearby memories for auto-linking
-        let neighbors: Vec<(i64, f64)> = {
+        let neighbors: Vec<(i64, f64, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT v.memory_id, v.distance
+                "SELECT v.memory_id, v.distance, m.mnemonic, m.tags
                  FROM memory_vectors v
+                 JOIN memories m ON m.id = v.memory_id
                  WHERE v.embedding MATCH ?1
                  AND v.k = ?2
                  ORDER BY v.distance",
             )?;
             stmt.query_map(
                 params![embedding.as_bytes(), AUTO_LINK_MAX_NEIGHBORS + 1],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
+        // Collect neighbor info for the result (exclude self, within AUTO_LINK_THRESHOLD)
+        let result_neighbors: Vec<MemorizeNeighbor> = neighbors
+            .iter()
+            .filter(|(nid, dist, _, _)| *nid != memory_id && *dist < AUTO_LINK_THRESHOLD)
+            .map(|(_, dist, mnem, tags_json)| {
+                let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+                MemorizeNeighbor {
+                    mnemonic: mnem.clone(),
+                    distance: *dist,
+                    tags,
+                }
+            })
+            .collect();
+
         // Check for auto-merge candidate (closest neighbor below merge threshold)
         let merge_candidate: Option<(i64, String, String, String)> = neighbors
             .iter()
-            .filter(|(nid, dist)| *nid != memory_id && *dist < AUTO_MERGE_THRESHOLD)
+            .filter(|(nid, dist, _, _)| *nid != memory_id && *dist < AUTO_MERGE_THRESHOLD)
             .next()
-            .map(|(nid, _)| {
+            .map(|(nid, _, _, _)| {
                 tx.query_row(
                     "SELECT id, mnemonic, content, tags FROM memories WHERE id = ?1",
                     params![nid],
@@ -301,7 +316,7 @@ impl MemoryStore {
             })
             .transpose()?;
 
-        if let Some((old_id, _old_mnemonic, old_content, old_tags_json)) = merge_candidate {
+        let merged_with = if let Some((old_id, ref old_mnemonic_str, old_content, old_tags_json)) = merge_candidate {
             // Concatenate content: new + old
             let merged_content = format!("{content}\n\n{old_content}");
             // Union tags
@@ -344,10 +359,12 @@ impl MemoryStore {
 
             // Delete old memory (CASCADE handles vectors + remaining links)
             tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
+
+            Some(old_mnemonic_str.clone())
         } else {
             // No merge — just auto-link
-            for (neighbor_id, distance) in &neighbors {
-                if *neighbor_id != memory_id && *distance < AUTO_LINK_THRESHOLD {
+            for (neighbor_id, dist, _, _) in &neighbors {
+                if *neighbor_id != memory_id && *dist < AUTO_LINK_THRESHOLD {
                     tx.execute(
                         "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
                          VALUES (?1, ?2, 'related')",
@@ -355,10 +372,14 @@ impl MemoryStore {
                     )?;
                 }
             }
-        }
+            None
+        };
 
         tx.commit()?;
-        Ok(())
+        Ok(MemorizeResult {
+            merged_with,
+            neighbors: result_neighbors,
+        })
     }
 
     pub fn link(
@@ -989,6 +1010,116 @@ impl MemoryStore {
         Ok(())
     }
 
+    pub fn edit_memory(
+        &self,
+        mnemonic: &str,
+        new_mnemonic: Option<&str>,
+        add_tags: &[String],
+        remove_tags: &[String],
+        new_embedding: Option<&[f32]>,
+    ) -> Result<EditResult> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let (memory_id, current_tags_json): (i64, String) = tx
+            .query_row(
+                "SELECT id, tags FROM memories WHERE mnemonic = ?1",
+                params![mnemonic],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| anyhow!("mnemonic not found: {}", mnemonic))?;
+
+        // Update tags
+        let mut tags: Vec<String> = serde_json::from_str(&current_tags_json).unwrap_or_default();
+        for t in add_tags {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        tags.retain(|t| !remove_tags.contains(t));
+        let tags_json = serde_json::to_string(&tags)?;
+
+        tx.execute(
+            "UPDATE memories SET tags = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![tags_json, memory_id],
+        )?;
+
+        // Update mnemonic + re-embed if requested
+        let final_mnemonic = if let Some(new_mn) = new_mnemonic {
+            let embedding = new_embedding
+                .ok_or_else(|| anyhow!("new_embedding required when changing mnemonic"))?;
+
+            // Check for conflict
+            let conflict: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE mnemonic = ?1 AND id != ?2",
+                    params![new_mn, memory_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)?;
+            if conflict {
+                return Err(anyhow!("mnemonic already exists: {}", new_mn));
+            }
+
+            tx.execute(
+                "UPDATE memories SET mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![new_mn, memory_id],
+            )?;
+
+            tx.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                params![memory_id],
+            )?;
+            tx.execute(
+                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                params![memory_id, embedding.as_bytes()],
+            )?;
+
+            new_mn.to_string()
+        } else {
+            mnemonic.to_string()
+        };
+
+        tx.commit()?;
+        Ok(EditResult {
+            old_mnemonic: mnemonic.to_string(),
+            new_mnemonic: final_mnemonic,
+            tags,
+            re_embedded: new_mnemonic.is_some(),
+        })
+    }
+
+    pub fn rename_tag(&self, old_tag: &str, new_tag: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tags FROM memories WHERE tags LIKE ?1",
+        )?;
+        let pattern = format!("%\"{}\"%", old_tag.replace('"', "\"\""));
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![pattern], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut count = 0;
+        for (id, tags_json) in &rows {
+            let mut tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+            if !tags.contains(&old_tag.to_string()) {
+                continue;
+            }
+            tags.retain(|t| t != old_tag);
+            if !tags.contains(&new_tag.to_string()) {
+                tags.push(new_tag.to_string());
+            }
+            let new_json = serde_json::to_string(&tags)?;
+            self.conn.execute(
+                "UPDATE memories SET tags = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![new_json, id],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
     pub fn delete_memory(&self, mnemonic: &str) -> Result<bool> {
         let rows = self.conn.execute(
             "DELETE FROM memories WHERE mnemonic = ?1",
@@ -1081,6 +1212,27 @@ pub struct MemorySummary {
 pub struct TagCount {
     pub tag: String,
     pub count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemorizeResult {
+    pub merged_with: Option<String>,
+    pub neighbors: Vec<MemorizeNeighbor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemorizeNeighbor {
+    pub mnemonic: String,
+    pub distance: f64,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditResult {
+    pub old_mnemonic: String,
+    pub new_mnemonic: String,
+    pub tags: Vec<String>,
+    pub re_embedded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
