@@ -11,6 +11,8 @@ struct Frontmatter {
     uuid: String,
     mnemonic: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mnemonics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     links: Vec<ExportLink>,
@@ -58,8 +60,9 @@ fn slugify(s: &str) -> String {
 }
 
 struct ExportRow {
+    memory_id: i64,
     uuid: String,
-    mnemonic: String,
+    title: String,
     content: String,
     tags_json: String,
 }
@@ -80,10 +83,10 @@ impl MemoryStore {
                 let placeholders: Vec<String> =
                     (1..=filter_tags.len()).map(|i| format!("?{i}")).collect();
                 let sql = format!(
-                    "SELECT DISTINCT m.uuid, m.mnemonic, m.content, m.tags
+                    "SELECT DISTINCT m.id, m.uuid, m.title, m.content, m.tags
                      FROM memories m, json_each(m.tags) je
                      WHERE je.value IN ({})
-                     ORDER BY m.mnemonic",
+                     ORDER BY m.title",
                     placeholders.join(", ")
                 );
                 let mut stmt = self.conn().prepare(&sql)?;
@@ -93,24 +96,26 @@ impl MemoryStore {
                     .collect();
                 stmt.query_map(params.as_slice(), |row| {
                     Ok(ExportRow {
-                        uuid: row.get(0)?,
-                        mnemonic: row.get(1)?,
-                        content: row.get(2)?,
-                        tags_json: row.get(3)?,
+                        memory_id: row.get(0)?,
+                        uuid: row.get(1)?,
+                        title: row.get(2)?,
+                        content: row.get(3)?,
+                        tags_json: row.get(4)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
             }
             _ => {
                 let mut stmt = self.conn().prepare(
-                    "SELECT uuid, mnemonic, content, tags FROM memories ORDER BY mnemonic",
+                    "SELECT id, uuid, title, content, tags FROM memories ORDER BY title",
                 )?;
                 stmt.query_map([], |row| {
                     Ok(ExportRow {
-                        uuid: row.get(0)?,
-                        mnemonic: row.get(1)?,
-                        content: row.get(2)?,
-                        tags_json: row.get(3)?,
+                        memory_id: row.get(0)?,
+                        uuid: row.get(1)?,
+                        title: row.get(2)?,
+                        content: row.get(3)?,
+                        tags_json: row.get(4)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -146,6 +151,13 @@ impl MemoryStore {
         for row in &rows {
             let tags: Vec<String> = serde_json::from_str(&row.tags_json).unwrap_or_default();
 
+            // Get additional mnemonics (excluding title itself)
+            let mnemonics: Vec<String> = MemoryStore::get_mnemonics_for_memory(self.conn(), row.memory_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m != &row.title)
+                .collect();
+
             // Collect links where this memory is the source
             let links: Vec<ExportLink> = link_rows
                 .iter()
@@ -158,7 +170,8 @@ impl MemoryStore {
 
             let fm = Frontmatter {
                 uuid: row.uuid.clone(),
-                mnemonic: row.mnemonic.clone(),
+                mnemonic: row.title.clone(),
+                mnemonics,
                 tags,
                 links,
             };
@@ -166,7 +179,7 @@ impl MemoryStore {
             let yaml = serde_norway::to_string(&fm)?;
             let file_content = format!("---\n{yaml}---\n\n{}", row.content);
 
-            let filename = format!("{}.md", slugify(&row.mnemonic));
+            let filename = format!("{}.md", slugify(&row.title));
             let path = dir.join(&filename);
             std::fs::write(&path, file_content)?;
         }
@@ -180,7 +193,6 @@ impl MemoryStore {
         }
 
         let mut result = ImportResult::default();
-        let mut imported: Vec<(String, String)> = Vec::new(); // (uuid, mnemonic) for link resolution
 
         // Read all .md files
         let mut entries: Vec<_> = std::fs::read_dir(dir)?
@@ -206,7 +218,7 @@ impl MemoryStore {
                 )
                 .ok();
 
-            match existing {
+            let memory_id: i64 = match existing {
                 Some((id, old_content)) => {
                     if old_content == content {
                         result.unchanged += 1;
@@ -214,10 +226,29 @@ impl MemoryStore {
                         let tags_json = serde_json::to_string(&fm.tags)?;
                         let embedding = embedder.embed(&fm.mnemonic)?;
                         self.conn().execute(
-                            "UPDATE memories SET content = ?1, tags = ?2, mnemonic = ?3, updated_at = datetime('now') WHERE id = ?4",
+                            "UPDATE memories SET content = ?1, tags = ?2, title = ?3, mnemonic = ?3, updated_at = datetime('now') WHERE id = ?4",
                             params![content, tags_json, fm.mnemonic, id],
                         )?;
-                        // Update vector
+                        // Update primary mnemonic in mnemonics table
+                        self.conn().execute(
+                            "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+                            params![id, fm.mnemonic],
+                        )?;
+                        let mn_id: i64 = self.conn().query_row(
+                            "SELECT id FROM mnemonics WHERE text = ?1",
+                            params![fm.mnemonic],
+                            |row| row.get(0),
+                        )?;
+                        // Update mnemonic vector
+                        self.conn().execute(
+                            "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                            params![mn_id],
+                        )?;
+                        self.conn().execute(
+                            "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                            params![mn_id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                        )?;
+                        // Also update legacy memory_vectors
                         self.conn().execute(
                             "DELETE FROM memory_vectors WHERE memory_id = ?1",
                             params![id],
@@ -228,28 +259,71 @@ impl MemoryStore {
                         )?;
                         result.updated += 1;
                     }
+                    id
                 }
                 None => {
                     let tags_json = serde_json::to_string(&fm.tags)?;
                     let embedding = embedder.embed(&fm.mnemonic)?;
                     self.conn().execute(
-                        "INSERT INTO memories (uuid, mnemonic, content, tags) VALUES (?1, ?2, ?3, ?4)",
-                        params![fm.uuid, fm.mnemonic, content, tags_json],
+                        "INSERT INTO memories (uuid, mnemonic, title, content, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![fm.uuid, fm.mnemonic, fm.mnemonic, content, tags_json],
                     )?;
                     let id: i64 = self.conn().query_row(
                         "SELECT id FROM memories WHERE uuid = ?1",
                         params![fm.uuid],
                         |row| row.get(0),
                     )?;
+                    // Insert primary mnemonic
+                    self.conn().execute(
+                        "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+                        params![id, fm.mnemonic],
+                    )?;
+                    let mn_id: i64 = self.conn().query_row(
+                        "SELECT id FROM mnemonics WHERE text = ?1",
+                        params![fm.mnemonic],
+                        |row| row.get(0),
+                    )?;
+                    self.conn().execute(
+                        "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                        params![mn_id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                    )?;
+                    // Also insert legacy memory_vectors
                     self.conn().execute(
                         "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
                         params![id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
                     )?;
                     result.created += 1;
+                    id
+                }
+            };
+
+            // Import additional mnemonics
+            for mn_text in &fm.mnemonics {
+                self.conn().execute(
+                    "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+                    params![memory_id, mn_text],
+                )?;
+                let mn_id: Option<i64> = self.conn().query_row(
+                    "SELECT id FROM mnemonics WHERE text = ?1",
+                    params![mn_text],
+                    |row| row.get(0),
+                ).ok();
+                if let Some(mn_id) = mn_id {
+                    // Check if already has vector
+                    let has_vec: bool = self.conn().query_row(
+                        "SELECT COUNT(*) FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                        params![mn_id],
+                        |row| row.get::<_, i64>(0),
+                    ).map(|c| c > 0)?;
+                    if !has_vec {
+                        let emb = embedder.embed(mn_text)?;
+                        self.conn().execute(
+                            "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                            params![mn_id, zerocopy::AsBytes::as_bytes(emb.as_slice())],
+                        )?;
+                    }
                 }
             }
-
-            imported.push((fm.uuid, fm.mnemonic));
         }
 
         // Recreate links from UUID references (second pass)
@@ -259,7 +333,6 @@ impl MemoryStore {
             let (fm, _) = parse_frontmatter(&raw).unwrap();
 
             for link in &fm.links {
-                // Resolve source and target UUIDs to IDs
                 let source_id: Option<i64> = self
                     .conn()
                     .query_row(

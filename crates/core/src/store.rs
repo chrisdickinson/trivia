@@ -55,6 +55,8 @@ pub struct Memory {
     pub mnemonic: String,
     pub content: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mnemonics: Vec<String>,
     pub distance: f64,
     pub score: f64,
     pub created_at: DateTime<Utc>,
@@ -175,53 +177,253 @@ impl MemoryStore {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_uuid ON memories(uuid);"
         )?;
 
-        // FTS5 index for full-text search on mnemonic + content
+        // --- Multiple mnemonics migration ---
+        // 1. Add title column to memories
+        add_column("ALTER TABLE memories ADD COLUMN title TEXT;")?;
+
+        // 2. Backfill title from mnemonic
         self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-                mnemonic,
-                content,
-                content='memories',
-                content_rowid='id',
-                tokenize='porter unicode61'
-            );
-
-            -- Sync triggers
-            CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memory_fts(rowid, mnemonic, content)
-                VALUES (new.id, new.mnemonic, new.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memory_fts(memory_fts, rowid, mnemonic, content)
-                VALUES ('delete', old.id, old.mnemonic, old.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memory_fts(memory_fts, rowid, mnemonic, content)
-                VALUES ('delete', old.id, old.mnemonic, old.content);
-                INSERT INTO memory_fts(rowid, mnemonic, content)
-                VALUES (new.id, new.mnemonic, new.content);
-            END;"
+            "UPDATE memories SET title = mnemonic WHERE title IS NULL;"
         )?;
 
-        // Backfill FTS if empty (first run on existing DB)
-        let fts_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memory_fts",
+        // 3. Unique index on title
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_title ON memories(title);"
+        )?;
+
+        // 4. Create mnemonics table + backfill
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mnemonics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                text TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT (datetime('now'))
+            );"
+        )?;
+        self.conn.execute_batch(
+            "INSERT OR IGNORE INTO mnemonics (memory_id, text, created_at)
+             SELECT id, mnemonic, created_at FROM memories;"
+        )?;
+
+        // 5. Create mnemonic_vectors virtual table
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS mnemonic_vectors USING vec0(
+                mnemonic_id INTEGER PRIMARY KEY,
+                embedding float[384]
+            );"
+        )?;
+
+        // 6. Vector migration: copy from memory_vectors to mnemonic_vectors if needed
+        let mv_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM mnemonic_vectors", [], |row| row.get(0),
+        )?;
+        let old_mv_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_vectors", [], |row| row.get(0),
+        )?;
+        if mv_count == 0 && old_mv_count > 0 {
+            let mut stmt = self.conn.prepare(
+                "SELECT mv.memory_id, mv.embedding FROM memory_vectors mv"
+            )?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+            for (memory_id, embedding_blob) in &rows {
+                let mnemonic_id: Option<i64> = self.conn.query_row(
+                    "SELECT id FROM mnemonics WHERE memory_id = ?1 LIMIT 1",
+                    params![memory_id],
+                    |row| row.get(0),
+                ).ok();
+                if let Some(mn_id) = mnemonic_id {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                        params![mn_id, embedding_blob],
+                    )?;
+                }
+            }
+        }
+
+        // 7. FTS rebuild: detect old-style triggers (referencing new.mnemonic)
+        //    and rebuild to use title+content
+        let needs_fts_rebuild = {
+            let trigger_sql: Option<String> = self.conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memory_fts_ai'",
+                [],
+                |row| row.get(0),
+            ).ok();
+            match trigger_sql {
+                Some(sql) => sql.contains("new.mnemonic"),
+                None => false, // no trigger yet, create fresh
+            }
+        };
+
+        let fts_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_fts'",
             [],
-            |row| row.get(0),
-        )?;
-        let mem_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memories",
-            [],
-            |row| row.get(0),
-        )?;
-        if fts_count == 0 && mem_count > 0 {
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0)?;
+
+        if needs_fts_rebuild {
+            // Drop old triggers and FTS table, recreate with title+content
             self.conn.execute_batch(
-                "INSERT INTO memory_fts(rowid, mnemonic, content)
-                 SELECT id, mnemonic, content FROM memories;"
+                "DROP TRIGGER IF EXISTS memory_fts_ai;
+                 DROP TRIGGER IF EXISTS memory_fts_ad;
+                 DROP TRIGGER IF EXISTS memory_fts_au;
+                 DROP TABLE IF EXISTS memory_fts;"
             )?;
         }
 
+        if needs_fts_rebuild || !fts_exists {
+            self.conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                    title,
+                    content,
+                    content='memories',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memory_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                    INSERT INTO memory_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;"
+            )?;
+
+            // Backfill FTS
+            let mem_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM memories", [], |row| row.get(0),
+            )?;
+            if mem_count > 0 {
+                self.conn.execute_batch(
+                    "INSERT INTO memory_fts(rowid, title, content)
+                     SELECT id, title, content FROM memories;"
+                )?;
+            }
+        } else {
+            // Fresh DB or already migrated — ensure FTS and triggers exist
+            self.conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                    title,
+                    content,
+                    content='memories',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memory_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memory_fts(memory_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                    INSERT INTO memory_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;"
+            )?;
+
+            // Backfill FTS if empty (first run on existing DB)
+            let fts_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM memory_fts", [], |row| row.get(0),
+            )?;
+            let mem_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM memories", [], |row| row.get(0),
+            )?;
+            if fts_count == 0 && mem_count > 0 {
+                self.conn.execute_batch(
+                    "INSERT INTO memory_fts(rowid, title, content)
+                     SELECT id, title, content FROM memories;"
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Look up memory id by title (the stable display name).
+    fn memory_id_by_title(conn: &Connection, title: &str) -> Result<i64> {
+        conn.query_row(
+            "SELECT id FROM memories WHERE title = ?1",
+            params![title],
+            |row| row.get(0),
+        ).map_err(|_| anyhow!("memory not found: {}", title))
+    }
+
+    /// Get all mnemonic texts for a memory.
+    pub fn get_mnemonics_for_memory(conn: &Connection, memory_id: i64) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT text FROM mnemonics WHERE memory_id = ?1 ORDER BY id"
+        )?;
+        let results = stmt.query_map(params![memory_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(results)
+    }
+
+    pub fn add_mnemonic(&self, title: &str, text: &str, embedding: &[f32]) -> Result<()> {
+        let memory_id = Self::memory_id_by_title(&self.conn, title)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+            params![memory_id, text],
+        )?;
+        let mnemonic_id: i64 = tx.query_row(
+            "SELECT id FROM mnemonics WHERE text = ?1",
+            params![text],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+            params![mnemonic_id, embedding.as_bytes()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_mnemonic(&self, title: &str, text: &str) -> Result<()> {
+        let memory_id = Self::memory_id_by_title(&self.conn, title)?;
+        // Guard: cannot remove last mnemonic
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM mnemonics WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )?;
+        if count <= 1 {
+            return Err(anyhow!("cannot remove the last mnemonic"));
+        }
+        let mnemonic_id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM mnemonics WHERE memory_id = ?1 AND text = ?2",
+            params![memory_id, text],
+            |row| row.get(0),
+        ).ok();
+        if let Some(mn_id) = mnemonic_id {
+            // vec0 doesn't support FK CASCADE, delete manually
+            self.conn.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                params![mn_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM mnemonics WHERE id = ?1",
+                params![mn_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -236,25 +438,63 @@ impl MemoryStore {
 
         let tx = self.conn.unchecked_transaction()?;
 
-        // Upsert the memory text
-        let new_uuid = Uuid::new_v4().to_string();
-        tx.execute(
-            "INSERT INTO memories (mnemonic, content, tags, uuid)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(mnemonic) DO UPDATE SET
-                content = excluded.content,
-                tags = excluded.tags,
-                updated_at = datetime('now')",
-            params![mnemonic, content, tags_json, new_uuid],
-        )?;
+        // Look up existing mnemonic in mnemonics table first
+        let existing_via_mnemonic: Option<i64> = tx.query_row(
+            "SELECT memory_id FROM mnemonics WHERE text = ?1",
+            params![mnemonic],
+            |row| row.get(0),
+        ).ok();
 
-        let memory_id: i64 = tx.query_row(
-            "SELECT id FROM memories WHERE mnemonic = ?1",
+        let memory_id: i64 = if let Some(mid) = existing_via_mnemonic {
+            // Update existing memory's content/tags
+            tx.execute(
+                "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
+                params![content, tags_json, mid],
+            )?;
+            mid
+        } else {
+            // Create new memory with title = mnemonic
+            let new_uuid = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO memories (mnemonic, title, content, tags, uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(mnemonic) DO UPDATE SET
+                    content = excluded.content,
+                    tags = excluded.tags,
+                    updated_at = datetime('now')",
+                params![mnemonic, mnemonic, content, tags_json, new_uuid],
+            )?;
+            let mid: i64 = tx.query_row(
+                "SELECT id FROM memories WHERE title = ?1",
+                params![mnemonic],
+                |row| row.get(0),
+            )?;
+            // Insert into mnemonics table
+            tx.execute(
+                "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+                params![mid, mnemonic],
+            )?;
+            mid
+        };
+
+        // Get the mnemonic row id for vector storage
+        let mnemonic_row_id: i64 = tx.query_row(
+            "SELECT id FROM mnemonics WHERE text = ?1",
             params![mnemonic],
             |row| row.get(0),
         )?;
 
-        // Delete existing vector if any, then insert new one
+        // Delete existing vector for this mnemonic, then insert new one
+        tx.execute(
+            "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+            params![mnemonic_row_id],
+        )?;
+        tx.execute(
+            "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+            params![mnemonic_row_id, embedding.as_bytes()],
+        )?;
+
+        // Also update legacy memory_vectors for backward compat
         tx.execute(
             "DELETE FROM memory_vectors WHERE memory_id = ?1",
             params![memory_id],
@@ -264,31 +504,40 @@ impl MemoryStore {
             params![memory_id, embedding.as_bytes()],
         )?;
 
-        // After inserting the vector, find nearby memories for auto-linking
-        let neighbors: Vec<(i64, f64, String, String)> = {
+        // Find nearby memories via mnemonic_vectors, dedup by memory_id
+        let neighbors: Vec<(i64, i64, f64, String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT v.memory_id, v.distance, m.mnemonic, m.tags
-                 FROM memory_vectors v
-                 JOIN memories m ON m.id = v.memory_id
+                "SELECT mn.memory_id, v.mnemonic_id, v.distance, m.title, m.tags
+                 FROM mnemonic_vectors v
+                 JOIN mnemonics mn ON mn.id = v.mnemonic_id
+                 JOIN memories m ON m.id = mn.memory_id
                  WHERE v.embedding MATCH ?1
                  AND v.k = ?2
                  ORDER BY v.distance",
             )?;
             stmt.query_map(
-                params![embedding.as_bytes(), AUTO_LINK_MAX_NEIGHBORS + 1],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                params![embedding.as_bytes(), (AUTO_LINK_MAX_NEIGHBORS + 1) * 3],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, f64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        // Collect neighbor info for the result (exclude self, within AUTO_LINK_THRESHOLD)
-        let result_neighbors: Vec<MemorizeNeighbor> = neighbors
+        // Dedup by memory_id, keep best (lowest) distance, exclude self
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<(i64, f64, String, String)> = neighbors
+            .into_iter()
+            .filter(|(mid, _, _, _, _)| *mid != memory_id && seen.insert(*mid))
+            .map(|(mid, _, dist, title, tags)| (mid, dist, title, tags))
+            .collect();
+
+        // Collect neighbor info for the result (within AUTO_LINK_THRESHOLD)
+        let result_neighbors: Vec<MemorizeNeighbor> = deduped
             .iter()
-            .filter(|(nid, dist, _, _)| *nid != memory_id && *dist < AUTO_LINK_THRESHOLD)
-            .map(|(_, dist, mnem, tags_json)| {
+            .filter(|(_, dist, _, _)| *dist < AUTO_LINK_THRESHOLD)
+            .map(|(_, dist, title, tags_json)| {
                 let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
                 MemorizeNeighbor {
-                    mnemonic: mnem.clone(),
+                    mnemonic: title.clone(),
                     distance: *dist,
                     tags,
                 }
@@ -296,14 +545,14 @@ impl MemoryStore {
             .collect();
 
         // Check for auto-merge candidate (closest neighbor below merge threshold)
-        let merge_candidate: Option<(i64, String, String, String)> = neighbors
+        let merge_candidate: Option<(i64, String, String, String)> = deduped
             .iter()
-            .filter(|(nid, dist, _, _)| *nid != memory_id && *dist < AUTO_MERGE_THRESHOLD)
+            .filter(|(_, dist, _, _)| *dist < AUTO_MERGE_THRESHOLD)
             .next()
-            .map(|(nid, _, _, _)| {
+            .map(|(mid, _, _, _)| {
                 tx.query_row(
-                    "SELECT id, mnemonic, content, tags FROM memories WHERE id = ?1",
-                    params![nid],
+                    "SELECT id, title, content, tags FROM memories WHERE id = ?1",
+                    params![mid],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -316,7 +565,7 @@ impl MemoryStore {
             })
             .transpose()?;
 
-        let merged_with = if let Some((old_id, ref old_mnemonic_str, old_content, old_tags_json)) = merge_candidate {
+        let merged_with = if let Some((old_id, ref old_title, old_content, old_tags_json)) = merge_candidate {
             // Concatenate content: new + old
             let merged_content = format!("{content}\n\n{old_content}");
             // Union tags
@@ -334,6 +583,23 @@ impl MemoryStore {
             tx.execute(
                 "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
                 params![merged_content, merged_tags_json, memory_id],
+            )?;
+
+            // Transfer mnemonics from old to new
+            // First delete mnemonic_vectors for old memory's mnemonics
+            tx.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id IN (SELECT id FROM mnemonics WHERE memory_id = ?1)",
+                params![old_id],
+            )?;
+            // Transfer mnemonics rows
+            tx.execute(
+                "UPDATE OR IGNORE mnemonics SET memory_id = ?1 WHERE memory_id = ?2",
+                params![memory_id, old_id],
+            )?;
+            // Delete any orphaned mnemonics that conflicted
+            tx.execute(
+                "DELETE FROM mnemonics WHERE memory_id = ?1",
+                params![old_id],
             )?;
 
             // Transfer links from old to new
@@ -357,18 +623,24 @@ impl MemoryStore {
                 params![memory_id, old_id],
             )?;
 
-            // Delete old memory (CASCADE handles vectors + remaining links)
+            // Delete old memory_vectors
+            tx.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                params![old_id],
+            )?;
+
+            // Delete old memory (CASCADE handles remaining)
             tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
 
-            Some(old_mnemonic_str.clone())
+            Some(old_title.clone())
         } else {
             // No merge — just auto-link
-            for (neighbor_id, dist, _, _) in &neighbors {
-                if *neighbor_id != memory_id && *dist < AUTO_LINK_THRESHOLD {
+            for (neighbor_mid, dist, _, _) in &deduped {
+                if *dist < AUTO_LINK_THRESHOLD {
                     tx.execute(
                         "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
                          VALUES (?1, ?2, 'related')",
-                        params![memory_id, neighbor_id],
+                        params![memory_id, neighbor_mid],
                     )?;
                 }
             }
@@ -384,27 +656,14 @@ impl MemoryStore {
 
     pub fn link(
         &self,
-        source_mnemonic: &str,
-        target_mnemonic: &str,
+        source_title: &str,
+        target_title: &str,
         link_type: &str,
     ) -> Result<()> {
-        let source_id: i64 = self
-            .conn
-            .query_row(
-                "SELECT id FROM memories WHERE mnemonic = ?1",
-                params![source_mnemonic],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow!("source mnemonic not found: {}", source_mnemonic))?;
-
-        let target_id: i64 = self
-            .conn
-            .query_row(
-                "SELECT id FROM memories WHERE mnemonic = ?1",
-                params![target_mnemonic],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow!("target mnemonic not found: {}", target_mnemonic))?;
+        let source_id = Self::memory_id_by_title(&self.conn, source_title)
+            .map_err(|_| anyhow!("source not found: {}", source_title))?;
+        let target_id = Self::memory_id_by_title(&self.conn, target_title)
+            .map_err(|_| anyhow!("target not found: {}", target_title))?;
 
         self.conn.execute(
             "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
@@ -417,31 +676,31 @@ impl MemoryStore {
 
     pub fn unlink(
         &self,
-        source_mnemonic: &str,
-        target_mnemonic: &str,
+        source_title: &str,
+        target_title: &str,
         link_type: &str,
     ) -> Result<()> {
         self.conn.execute(
             "DELETE FROM memory_links
-             WHERE source_id = (SELECT id FROM memories WHERE mnemonic = ?1)
-             AND target_id = (SELECT id FROM memories WHERE mnemonic = ?2)
+             WHERE source_id = (SELECT id FROM memories WHERE title = ?1)
+             AND target_id = (SELECT id FROM memories WHERE title = ?2)
              AND link_type = ?3",
-            params![source_mnemonic, target_mnemonic, link_type],
+            params![source_title, target_title, link_type],
         )?;
         Ok(())
     }
 
-    pub fn get_links(&self, mnemonic: &str) -> Result<Vec<MemoryLink>> {
+    pub fn get_links(&self, title: &str) -> Result<Vec<MemoryLink>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.mnemonic, t.mnemonic, ml.link_type, ml.created_at
+            "SELECT s.title, t.title, ml.link_type, ml.created_at
              FROM memory_links ml
              JOIN memories s ON s.id = ml.source_id
              JOIN memories t ON t.id = ml.target_id
-             WHERE s.mnemonic = ?1 OR t.mnemonic = ?1",
+             WHERE s.title = ?1 OR t.title = ?1",
         )?;
 
         let links = stmt
-            .query_map(params![mnemonic], |row| {
+            .query_map(params![title], |row| {
                 let created_at_str: String = row.get(3)?;
                 Ok(MemoryLink {
                     source_mnemonic: row.get(0)?,
@@ -459,50 +718,52 @@ impl MemoryStore {
         &self,
         embedding: &[f32],
         threshold: f64,
-        exclude_mnemonic: &str,
+        exclude_title: &str,
     ) -> Result<Vec<(String, f64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.mnemonic, v.distance
-             FROM memory_vectors v
-             JOIN memories m ON m.id = v.memory_id
+            "SELECT m.title, v.distance
+             FROM mnemonic_vectors v
+             JOIN mnemonics mn ON mn.id = v.mnemonic_id
+             JOIN memories m ON m.id = mn.memory_id
              WHERE v.embedding MATCH ?1
              AND v.k = ?2
              ORDER BY v.distance",
         )?;
 
+        let mut seen = std::collections::HashSet::new();
         let results: Vec<(String, f64)> = stmt
             .query_map(
-                params![embedding.as_bytes(), AUTO_LINK_MAX_NEIGHBORS + 1],
+                params![embedding.as_bytes(), (AUTO_LINK_MAX_NEIGHBORS + 1) * 3],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|(mnemonic, distance)| mnemonic != exclude_mnemonic && *distance < threshold)
+            .filter(|(title, distance)| title != exclude_title && *distance < threshold && seen.insert(title.clone()))
             .collect();
 
         Ok(results)
     }
 
-    /// Merge two memories: keep absorbs discard's content, tags, and links.
+    /// Merge two memories: keep absorbs discard's content, tags, links, and mnemonics.
     /// The embedding should be the re-embedded mnemonic of `keep`.
     pub fn merge(&self, keep: &str, discard: &str, embedding: &[f32]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
         let (keep_id, keep_content, keep_tags_json): (i64, String, String) = tx
             .query_row(
-                "SELECT id, content, tags FROM memories WHERE mnemonic = ?1",
+                "SELECT id, content, tags FROM memories WHERE title = ?1",
                 params![keep],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|_| anyhow!("mnemonic not found: {}", keep))?;
+            .map_err(|_| anyhow!("memory not found: {}", keep))?;
 
         let (discard_id, discard_content, discard_tags_json): (i64, String, String) = tx
             .query_row(
-                "SELECT id, content, tags FROM memories WHERE mnemonic = ?1",
+                "SELECT id, content, tags FROM memories WHERE title = ?1",
                 params![discard],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|_| anyhow!("mnemonic not found: {}", discard))?;
+            .map_err(|_| anyhow!("memory not found: {}", discard))?;
 
         // Concatenate content
         let merged_content = format!("{keep_content}\n\n{discard_content}");
@@ -525,7 +786,24 @@ impl MemoryStore {
             params![merged_content, merged_tags_json, keep_id],
         )?;
 
-        // Re-embed
+        // Re-embed keep's primary mnemonic
+        let keep_primary_mn_id: Option<i64> = tx.query_row(
+            "SELECT id FROM mnemonics WHERE text = ?1",
+            params![keep],
+            |row| row.get(0),
+        ).ok();
+        if let Some(mn_id) = keep_primary_mn_id {
+            tx.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                params![mn_id],
+            )?;
+            tx.execute(
+                "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                params![mn_id, embedding.as_bytes()],
+            )?;
+        }
+
+        // Update legacy memory_vectors
         tx.execute(
             "DELETE FROM memory_vectors WHERE memory_id = ?1",
             params![keep_id],
@@ -533,6 +811,17 @@ impl MemoryStore {
         tx.execute(
             "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
             params![keep_id, embedding.as_bytes()],
+        )?;
+
+        // Transfer mnemonics from discard to keep (vectors stay valid, keyed by mnemonic_id)
+        tx.execute(
+            "UPDATE OR IGNORE mnemonics SET memory_id = ?1 WHERE memory_id = ?2",
+            params![keep_id, discard_id],
+        )?;
+        // Delete any orphaned mnemonics that conflicted (shouldn't happen, but safe)
+        tx.execute(
+            "DELETE FROM mnemonics WHERE memory_id = ?1",
+            params![discard_id],
         )?;
 
         // Transfer links from discard to keep
@@ -555,7 +844,13 @@ impl MemoryStore {
             params![keep_id, discard_id],
         )?;
 
-        // Delete discard
+        // Delete discard's legacy memory_vectors
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE memory_id = ?1",
+            params![discard_id],
+        )?;
+
+        // Delete discard memory
         tx.execute("DELETE FROM memories WHERE id = ?1", params![discard_id])?;
 
         tx.commit()?;
@@ -570,16 +865,17 @@ impl MemoryStore {
         fts_query: Option<&str>,
         exclude_tags: Option<&[String]>,
     ) -> Result<Vec<Memory>> {
-        // Overfetch 3x for composite scoring reranking
-        let base_fetch = limit * 3;
+        // Overfetch 5x for composite scoring reranking (extra to compensate for dedup)
+        let base_fetch = limit * 5;
         let fetch_limit = match tags {
             Some(_) => base_fetch * 4,
             None => base_fetch,
         };
 
-        let query = "SELECT m.mnemonic, m.content, m.tags, v.distance, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
-             FROM memory_vectors v
-             JOIN memories m ON m.id = v.memory_id
+        let query = "SELECT mn.memory_id, m.title, m.content, m.tags, v.distance, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
+             FROM mnemonic_vectors v
+             JOIN mnemonics mn ON mn.id = v.mnemonic_id
+             JOIN memories m ON m.id = mn.memory_id
              WHERE v.embedding MATCH ?1
              AND v.k = ?2
              ORDER BY v.distance";
@@ -589,26 +885,32 @@ impl MemoryStore {
         let rows = stmt
             .query_map(params![query_embedding.as_bytes(), fetch_limit], |row| {
                 Ok(MemoryRow {
-                    mnemonic: row.get(0)?,
-                    content: row.get(1)?,
-                    tags_json: row.get(2)?,
-                    distance: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    recall_count: row.get(6)?,
-                    last_recalled_at: row.get(7)?,
-                    useful_count: row.get(8)?,
-                    not_useful_count: row.get(9)?,
+                    memory_id: row.get(0)?,
+                    mnemonic: row.get(1)?,
+                    content: row.get(2)?,
+                    tags_json: row.get(3)?,
+                    distance: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    recall_count: row.get(7)?,
+                    last_recalled_at: row.get(8)?,
+                    useful_count: row.get(9)?,
+                    not_useful_count: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Build FTS match set if query provided
+        // Deduplicate by memory_id, keep best (lowest) distance per memory
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<MemoryRow> = rows.into_iter()
+            .filter(|row| seen.insert(row.memory_id))
+            .collect();
+
+        // Build FTS match set if query provided (now uses title column)
         let fts_matches: std::collections::HashSet<String> = match fts_query {
             Some(q) if !q.is_empty() => {
-                // Phrase-quote the query for FTS5
                 let escaped = q.replace('"', "\"\"");
-                let fts_sql = "SELECT m.mnemonic FROM memory_fts
+                let fts_sql = "SELECT m.title FROM memory_fts
                      JOIN memories m ON m.id = memory_fts.rowid
                      WHERE memory_fts MATCH ?1";
                 let mut fts_stmt = self.conn.prepare(fts_sql)?;
@@ -622,15 +924,17 @@ impl MemoryStore {
             _ => std::collections::HashSet::new(),
         };
 
-        let mut memories: Vec<Memory> = rows
+        let mut memories: Vec<Memory> = deduped
             .into_iter()
             .map(|row| {
                 let row_tags: Vec<String> =
                     serde_json::from_str(&row.tags_json).unwrap_or_default();
+                let mnemonics = Self::get_mnemonics_for_memory(&self.conn, row.memory_id).unwrap_or_default();
                 Memory {
                     mnemonic: row.mnemonic,
                     content: row.content,
                     tags: row_tags,
+                    mnemonics,
                     distance: row.distance,
                     score: 0.0,
                     created_at: parse_sqlite_datetime(&row.created_at),
@@ -658,7 +962,6 @@ impl MemoryStore {
         }
 
         // Compute composite scores
-        // Pre-collect similarity map to avoid borrow conflict
         let similarity_map: std::collections::HashMap<String, f64> = memories
             .iter()
             .map(|m| (m.mnemonic.clone(), 1.0 - m.distance))
@@ -679,7 +982,6 @@ impl MemoryStore {
 
             let frequency = (1.0 + mem.recall_count as f64).ln();
 
-            // Link boost: sum similarity of linked candidates (cap 3)
             let link_boost: f64 = mem
                 .links
                 .iter()
@@ -735,16 +1037,16 @@ impl MemoryStore {
         memories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         memories.truncate(limit);
 
-        // Update recall stats for all returned memories
-        let mnemonics: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
-        if !mnemonics.is_empty() {
+        // Update recall stats for all returned memories (by title)
+        let titles: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
+        if !titles.is_empty() {
             let placeholders: Vec<String> =
-                (1..=mnemonics.len()).map(|i| format!("?{i}")).collect();
+                (1..=titles.len()).map(|i| format!("?{i}")).collect();
             let sql = format!(
-                "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE mnemonic IN ({})",
+                "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE title IN ({})",
                 placeholders.join(", ")
             );
-            let params: Vec<&dyn rusqlite::types::ToSql> = mnemonics
+            let params: Vec<&dyn rusqlite::types::ToSql> = titles
                 .iter()
                 .map(|m| m as &dyn rusqlite::types::ToSql)
                 .collect();
@@ -756,7 +1058,7 @@ impl MemoryStore {
 
     pub fn list_all_summaries(&self) -> Result<Vec<MemorySummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT mnemonic, content, tags, recall_count, useful_count, not_useful_count
+            "SELECT id, title, content, tags, recall_count, useful_count, not_useful_count
              FROM memories
              ORDER BY recall_count DESC, updated_at DESC",
         )?;
@@ -764,22 +1066,25 @@ impl MemoryStore {
         let results = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(mnemonic, content, tags_json, recall_count, useful_count, not_useful_count)| {
+            .map(|(id, title, content, tags_json, recall_count, useful_count, not_useful_count)| {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                let mnemonics = Self::get_mnemonics_for_memory(&self.conn, id).unwrap_or_default();
                 MemorySummary {
-                    mnemonic,
+                    mnemonic: title,
                     content,
                     tags,
+                    mnemonics,
                     recall_count,
                     useful_count,
                     not_useful_count,
@@ -797,36 +1102,39 @@ impl MemoryStore {
         exclude: &std::collections::HashSet<String>,
         limit: usize,
     ) -> Result<Vec<MergeCandidate>> {
-        let fetch = limit + exclude.len() + 1;
+        let fetch = (limit + exclude.len() + 1) * 3; // extra for dedup
         let mut stmt = self.conn.prepare(
-            "SELECT m.mnemonic, m.content, m.tags, v.distance, m.recall_count
-             FROM memory_vectors v
-             JOIN memories m ON m.id = v.memory_id
+            "SELECT mn.memory_id, m.title, m.content, m.tags, v.distance, m.recall_count
+             FROM mnemonic_vectors v
+             JOIN mnemonics mn ON mn.id = v.mnemonic_id
+             JOIN memories m ON m.id = mn.memory_id
              WHERE v.embedding MATCH ?1
              AND v.k = ?2
              ORDER BY v.distance",
         )?;
 
+        let mut seen = std::collections::HashSet::new();
         let results = stmt
             .query_map(params![embedding.as_bytes(), fetch], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|(mnemonic, _, _, distance, _)| {
-                !exclude.contains(mnemonic) && *distance < threshold
+            .filter(|(mid, title, _, _, distance, _)| {
+                !exclude.contains(title) && *distance < threshold && seen.insert(*mid)
             })
             .take(limit)
-            .map(|(mnemonic, content, tags_json, distance, recall_count)| {
+            .map(|(_, title, content, tags_json, distance, recall_count)| {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                 MergeCandidate {
-                    mnemonic,
+                    mnemonic: title,
                     content,
                     tags,
                     distance,
@@ -838,35 +1146,38 @@ impl MemoryStore {
         Ok(results)
     }
 
-    pub fn get_memory_by_mnemonic(&self, mnemonic: &str) -> Result<Option<Memory>> {
+    pub fn get_memory_by_mnemonic(&self, title: &str) -> Result<Option<Memory>> {
         let row = self.conn.query_row(
-            "SELECT m.mnemonic, m.content, m.tags, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
+            "SELECT m.id, m.title, m.content, m.tags, m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.useful_count, m.not_useful_count
              FROM memories m
-             WHERE m.mnemonic = ?1",
-            params![mnemonic],
+             WHERE m.title = ?1",
+            params![title],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         );
 
         match row {
-            Ok((mnemonic, content, tags_json, created_at, updated_at, recall_count, last_recalled_at, useful_count, not_useful_count)) => {
+            Ok((id, title, content, tags_json, created_at, updated_at, recall_count, last_recalled_at, useful_count, not_useful_count)) => {
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-                let links = self.get_links(&mnemonic)?;
+                let mnemonics = Self::get_mnemonics_for_memory(&self.conn, id)?;
+                let links = self.get_links(&title)?;
                 Ok(Some(Memory {
-                    mnemonic,
+                    mnemonic: title,
                     content,
                     tags,
+                    mnemonics,
                     distance: 0.0,
                     score: 0.0,
                     created_at: parse_sqlite_datetime(&created_at),
@@ -883,7 +1194,7 @@ impl MemoryStore {
         }
     }
 
-    pub fn rate(&self, mnemonic: &str, useful: bool) -> Result<()> {
+    pub fn rate(&self, title: &str, useful: bool) -> Result<()> {
         let column = if useful {
             "useful_count"
         } else {
@@ -891,33 +1202,33 @@ impl MemoryStore {
         };
         let rows = self.conn.execute(
             &format!(
-                "UPDATE memories SET {column} = {column} + 1 WHERE mnemonic = ?1"
+                "UPDATE memories SET {column} = {column} + 1 WHERE title = ?1"
             ),
-            params![mnemonic],
+            params![title],
         )?;
         if rows == 0 {
-            return Err(anyhow!("mnemonic not found: {}", mnemonic));
+            return Err(anyhow!("memory not found: {}", title));
         }
         Ok(())
     }
 
-    /// Rate multiple memories at once. Returns the list of mnemonics that were NOT found.
-    pub fn rate_batch(&self, mnemonics: &[String], useful: bool) -> Result<Vec<String>> {
+    /// Rate multiple memories at once. Returns the list of titles that were NOT found.
+    pub fn rate_batch(&self, titles: &[String], useful: bool) -> Result<Vec<String>> {
         let column = if useful {
             "useful_count"
         } else {
             "not_useful_count"
         };
         let mut not_found = Vec::new();
-        for mnemonic in mnemonics {
+        for title in titles {
             let rows = self.conn.execute(
                 &format!(
-                    "UPDATE memories SET {column} = {column} + 1 WHERE mnemonic = ?1"
+                    "UPDATE memories SET {column} = {column} + 1 WHERE title = ?1"
                 ),
-                params![mnemonic],
+                params![title],
             )?;
             if rows == 0 {
-                not_found.push(mnemonic.clone());
+                not_found.push(title.clone());
             }
         }
         Ok(not_found)
@@ -925,7 +1236,7 @@ impl MemoryStore {
 
     pub fn update_memory(
         &self,
-        mnemonic: &str,
+        title: &str,
         content: &str,
         tags: &[String],
         embedding: &[f32],
@@ -935,17 +1246,35 @@ impl MemoryStore {
 
         let memory_id: i64 = tx
             .query_row(
-                "SELECT id FROM memories WHERE mnemonic = ?1",
-                params![mnemonic],
+                "SELECT id FROM memories WHERE title = ?1",
+                params![title],
                 |row| row.get(0),
             )
-            .map_err(|_| anyhow!("mnemonic not found: {}", mnemonic))?;
+            .map_err(|_| anyhow!("memory not found: {}", title))?;
 
         tx.execute(
             "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
             params![content, tags_json, memory_id],
         )?;
 
+        // Update primary mnemonic vector (the one matching title)
+        let primary_mn_id: Option<i64> = tx.query_row(
+            "SELECT id FROM mnemonics WHERE text = ?1",
+            params![title],
+            |row| row.get(0),
+        ).ok();
+        if let Some(mn_id) = primary_mn_id {
+            tx.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                params![mn_id],
+            )?;
+            tx.execute(
+                "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                params![mn_id, embedding.as_bytes()],
+            )?;
+        }
+
+        // Also update legacy memory_vectors
         tx.execute(
             "DELETE FROM memory_vectors WHERE memory_id = ?1",
             params![memory_id],
@@ -961,42 +1290,66 @@ impl MemoryStore {
 
     pub fn rename_memory(
         &self,
-        old_mnemonic: &str,
-        new_mnemonic: &str,
+        old_title: &str,
+        new_title: &str,
         embedding: &[f32],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
         let memory_id: i64 = tx
             .query_row(
-                "SELECT id FROM memories WHERE mnemonic = ?1",
-                params![old_mnemonic],
+                "SELECT id FROM memories WHERE title = ?1",
+                params![old_title],
                 |row| row.get(0),
             )
-            .map_err(|_| anyhow!("mnemonic not found: {}", old_mnemonic))?;
+            .map_err(|_| anyhow!("memory not found: {}", old_title))?;
 
         // Check for conflict
         let conflict: bool = tx
             .query_row(
-                "SELECT COUNT(*) FROM memories WHERE mnemonic = ?1 AND id != ?2",
-                params![new_mnemonic, memory_id],
+                "SELECT COUNT(*) FROM memories WHERE title = ?1 AND id != ?2",
+                params![new_title, memory_id],
                 |row| row.get::<_, i64>(0),
             )
             .map(|c| c > 0)?;
 
         if conflict {
             return Err(anyhow!(
-                "mnemonic already exists: {}",
-                new_mnemonic
+                "title already exists: {}",
+                new_title
             ));
         }
 
+        // Update title + keep mnemonic synced
         tx.execute(
-            "UPDATE memories SET mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![new_mnemonic, memory_id],
+            "UPDATE memories SET title = ?1, mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![new_title, memory_id],
         )?;
 
-        // Re-embed with new mnemonic
+        // Rename primary mnemonic in mnemonics table
+        tx.execute(
+            "UPDATE mnemonics SET text = ?1 WHERE memory_id = ?2 AND text = ?3",
+            params![new_title, memory_id, old_title],
+        )?;
+
+        // Re-embed the primary mnemonic
+        let primary_mn_id: Option<i64> = tx.query_row(
+            "SELECT id FROM mnemonics WHERE text = ?1",
+            params![new_title],
+            |row| row.get(0),
+        ).ok();
+        if let Some(mn_id) = primary_mn_id {
+            tx.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                params![mn_id],
+            )?;
+            tx.execute(
+                "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                params![mn_id, embedding.as_bytes()],
+            )?;
+        }
+
+        // Also update legacy memory_vectors
         tx.execute(
             "DELETE FROM memory_vectors WHERE memory_id = ?1",
             params![memory_id],
@@ -1012,21 +1365,24 @@ impl MemoryStore {
 
     pub fn edit_memory(
         &self,
-        mnemonic: &str,
-        new_mnemonic: Option<&str>,
+        title: &str,
+        new_title: Option<&str>,
         add_tags: &[String],
         remove_tags: &[String],
         new_embedding: Option<&[f32]>,
+        add_mnemonics: &[String],
+        remove_mnemonics: &[String],
+        mnemonic_embeddings: &[Vec<f32>],
     ) -> Result<EditResult> {
         let tx = self.conn.unchecked_transaction()?;
 
         let (memory_id, current_tags_json): (i64, String) = tx
             .query_row(
-                "SELECT id, tags FROM memories WHERE mnemonic = ?1",
-                params![mnemonic],
+                "SELECT id, tags FROM memories WHERE title = ?1",
+                params![title],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|_| anyhow!("mnemonic not found: {}", mnemonic))?;
+            .map_err(|_| anyhow!("memory not found: {}", title))?;
 
         // Update tags
         let mut tags: Vec<String> = serde_json::from_str(&current_tags_json).unwrap_or_default();
@@ -1043,28 +1399,53 @@ impl MemoryStore {
             params![tags_json, memory_id],
         )?;
 
-        // Update mnemonic + re-embed if requested
-        let final_mnemonic = if let Some(new_mn) = new_mnemonic {
+        // Update title + re-embed if requested
+        let final_title = if let Some(new_t) = new_title {
             let embedding = new_embedding
-                .ok_or_else(|| anyhow!("new_embedding required when changing mnemonic"))?;
+                .ok_or_else(|| anyhow!("new_embedding required when changing title"))?;
 
             // Check for conflict
             let conflict: bool = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM memories WHERE mnemonic = ?1 AND id != ?2",
-                    params![new_mn, memory_id],
+                    "SELECT COUNT(*) FROM memories WHERE title = ?1 AND id != ?2",
+                    params![new_t, memory_id],
                     |row| row.get::<_, i64>(0),
                 )
                 .map(|c| c > 0)?;
             if conflict {
-                return Err(anyhow!("mnemonic already exists: {}", new_mn));
+                return Err(anyhow!("title already exists: {}", new_t));
             }
 
+            // Update title + keep mnemonic synced
             tx.execute(
-                "UPDATE memories SET mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![new_mn, memory_id],
+                "UPDATE memories SET title = ?1, mnemonic = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![new_t, memory_id],
             )?;
 
+            // Rename primary mnemonic in mnemonics table
+            tx.execute(
+                "UPDATE mnemonics SET text = ?1 WHERE memory_id = ?2 AND text = ?3",
+                params![new_t, memory_id, title],
+            )?;
+
+            // Re-embed primary mnemonic
+            let primary_mn_id: Option<i64> = tx.query_row(
+                "SELECT id FROM mnemonics WHERE text = ?1",
+                params![new_t],
+                |row| row.get(0),
+            ).ok();
+            if let Some(mn_id) = primary_mn_id {
+                tx.execute(
+                    "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                    params![mn_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                    params![mn_id, embedding.as_bytes()],
+                )?;
+            }
+
+            // Also update legacy memory_vectors
             tx.execute(
                 "DELETE FROM memory_vectors WHERE memory_id = ?1",
                 params![memory_id],
@@ -1074,17 +1455,72 @@ impl MemoryStore {
                 params![memory_id, embedding.as_bytes()],
             )?;
 
-            new_mn.to_string()
+            new_t.to_string()
         } else {
-            mnemonic.to_string()
+            title.to_string()
         };
+
+        // Add new mnemonics
+        for (i, mn_text) in add_mnemonics.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
+                params![memory_id, mn_text],
+            )?;
+            if let Some(emb) = mnemonic_embeddings.get(i) {
+                let mn_id: i64 = tx.query_row(
+                    "SELECT id FROM mnemonics WHERE text = ?1",
+                    params![mn_text],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                    params![mn_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
+                    params![mn_id, emb.as_bytes()],
+                )?;
+            }
+        }
+
+        // Remove mnemonics
+        for mn_text in remove_mnemonics {
+            // Guard: cannot remove last mnemonic
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mnemonics WHERE memory_id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )?;
+            if count <= 1 {
+                return Err(anyhow!("cannot remove the last mnemonic"));
+            }
+            let mn_id: Option<i64> = tx.query_row(
+                "SELECT id FROM mnemonics WHERE memory_id = ?1 AND text = ?2",
+                params![memory_id, mn_text],
+                |row| row.get(0),
+            ).ok();
+            if let Some(mn_id) = mn_id {
+                tx.execute(
+                    "DELETE FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                    params![mn_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM mnemonics WHERE id = ?1",
+                    params![mn_id],
+                )?;
+            }
+        }
+
+        // Collect final mnemonics list
+        let mnemonics = Self::get_mnemonics_for_memory(&tx, memory_id)?;
 
         tx.commit()?;
         Ok(EditResult {
-            old_mnemonic: mnemonic.to_string(),
-            new_mnemonic: final_mnemonic,
+            old_mnemonic: title.to_string(),
+            new_mnemonic: final_title,
             tags,
-            re_embedded: new_mnemonic.is_some(),
+            mnemonics,
+            re_embedded: new_title.is_some(),
         })
     }
 
@@ -1120,10 +1556,27 @@ impl MemoryStore {
         Ok(count)
     }
 
-    pub fn delete_memory(&self, mnemonic: &str) -> Result<bool> {
+    pub fn delete_memory(&self, title: &str) -> Result<bool> {
+        // Must manually delete mnemonic_vectors rows first (vec0 doesn't support FK CASCADE)
+        let memory_id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM memories WHERE title = ?1",
+            params![title],
+            |row| row.get(0),
+        ).ok();
+        if let Some(mid) = memory_id {
+            self.conn.execute(
+                "DELETE FROM mnemonic_vectors WHERE mnemonic_id IN (SELECT id FROM mnemonics WHERE memory_id = ?1)",
+                params![mid],
+            )?;
+            // Also clean up legacy memory_vectors
+            self.conn.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                params![mid],
+            )?;
+        }
         let rows = self.conn.execute(
-            "DELETE FROM memories WHERE mnemonic = ?1",
-            params![mnemonic],
+            "DELETE FROM memories WHERE title = ?1",
+            params![title],
         )?;
         Ok(rows > 0)
     }
@@ -1150,7 +1603,7 @@ impl MemoryStore {
 
     pub fn get_all_links(&self) -> Result<Vec<MemoryLink>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.mnemonic, t.mnemonic, ml.link_type, ml.created_at
+            "SELECT s.title, t.title, ml.link_type, ml.created_at
              FROM memory_links ml
              JOIN memories s ON s.id = ml.source_id
              JOIN memories t ON t.id = ml.target_id",
@@ -1186,6 +1639,7 @@ fn days_between(earlier: DateTime<Utc>, later: DateTime<Utc>) -> f64 {
 }
 
 struct MemoryRow {
+    memory_id: i64,
     mnemonic: String,
     content: String,
     tags_json: String,
@@ -1203,6 +1657,8 @@ pub struct MemorySummary {
     pub mnemonic: String,
     pub content: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mnemonics: Vec<String>,
     pub recall_count: i64,
     pub useful_count: i64,
     pub not_useful_count: i64,
@@ -1232,6 +1688,7 @@ pub struct EditResult {
     pub old_mnemonic: String,
     pub new_mnemonic: String,
     pub tags: Vec<String>,
+    pub mnemonics: Vec<String>,
     pub re_embedded: bool,
 }
 
@@ -1673,6 +2130,239 @@ mod tests {
             links.iter().any(|l| l.target_mnemonic == "other" || l.source_mnemonic == "other"),
             "links should transfer from discard to keep"
         );
+
+        Ok(())
+    }
+
+    // --- Multiple mnemonics tests ---
+
+    #[test]
+    fn test_add_and_remove_mnemonic() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        let alias_emb: Vec<f32> = vec![0.2; 384];
+
+        store.memorize("primary", "some content", &[], &emb)?;
+        store.add_mnemonic("primary", "alias1", &alias_emb)?;
+
+        // Memory should now have 2 mnemonics
+        let mem = store.get_memory_by_mnemonic("primary")?.unwrap();
+        assert_eq!(mem.mnemonics.len(), 2);
+        assert!(mem.mnemonics.contains(&"primary".to_string()));
+        assert!(mem.mnemonics.contains(&"alias1".to_string()));
+
+        // Remove alias
+        store.remove_mnemonic("primary", "alias1")?;
+        let mem = store.get_memory_by_mnemonic("primary")?.unwrap();
+        assert_eq!(mem.mnemonics.len(), 1);
+        assert!(mem.mnemonics.contains(&"primary".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cannot_remove_last_mnemonic() {
+        let store = MemoryStore::in_memory().unwrap();
+        let emb: Vec<f32> = vec![0.1; 384];
+        store.memorize("only", "content", &[], &emb).unwrap();
+
+        let result = store.remove_mnemonic("only", "only");
+        assert!(result.is_err(), "should not be able to remove last mnemonic");
+    }
+
+    #[test]
+    fn test_recall_finds_memory_by_alias() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        let alias_emb: Vec<f32> = vec![-0.3; 384];
+
+        store.memorize("original-name", "some content", &[], &emb)?;
+        store.add_mnemonic("original-name", "alias-name", &alias_emb)?;
+
+        // Recall by alias embedding should find the memory
+        let results = store.recall(&alias_emb, 5, None, None, None)?;
+        assert!(!results.is_empty());
+        assert_eq!(results[0].mnemonic, "original-name");
+        // Should have both mnemonics
+        assert!(results[0].mnemonics.len() >= 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recall_dedup_by_memory() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        // Create a memory with 3 similar mnemonics
+        let emb1: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let emb2: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.001).collect();
+        let emb3: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 - 0.001).collect();
+
+        store.memorize("multi-mn", "content", &[], &emb1)?;
+        store.add_mnemonic("multi-mn", "alias-a", &emb2)?;
+        store.add_mnemonic("multi-mn", "alias-b", &emb3)?;
+
+        // Recall should return only 1 result (deduped by memory_id)
+        let query: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let results = store.recall(&query, 5, None, None, None)?;
+        let count = results.iter().filter(|m| m.mnemonic == "multi-mn").count();
+        assert_eq!(count, 1, "same memory should appear only once in results");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_auto_merge_ignores_same_memory_mnemonics() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        // Create a memory, then add a very close alias
+        let emb: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let close_emb: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0 + 0.00001).collect();
+
+        store.memorize("base-memory", "content", &[], &emb)?;
+        // Adding a close alias should NOT trigger auto-merge on the same memory
+        store.add_mnemonic("base-memory", "close-alias", &close_emb)?;
+
+        // Memory should still exist with both mnemonics
+        let mem = store.get_memory_by_mnemonic("base-memory")?.unwrap();
+        assert_eq!(mem.mnemonics.len(), 2);
+        assert!(mem.content == "content", "content should not be merged with itself");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_transfers_mnemonics() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb1: Vec<f32> = vec![0.1; 384];
+        let emb2: Vec<f32> = vec![-0.5; 384];
+        let alias_emb: Vec<f32> = vec![0.3; 384];
+
+        store.memorize("keeper", "keep content", &[], &emb1)?;
+        store.memorize("goner", "gone content", &[], &emb2)?;
+        store.add_mnemonic("goner", "goner-alias", &alias_emb)?;
+
+        store.merge("keeper", "goner", &emb1)?;
+
+        // keeper should now have goner's mnemonics
+        let mem = store.get_memory_by_mnemonic("keeper")?.unwrap();
+        assert!(mem.mnemonics.contains(&"goner".to_string()) || mem.mnemonics.contains(&"goner-alias".to_string()),
+            "merged memory should inherit mnemonics from discard");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_cleans_up_mnemonic_vectors() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        let alias_emb: Vec<f32> = vec![0.2; 384];
+
+        store.memorize("deleteme", "content", &[], &emb)?;
+        store.add_mnemonic("deleteme", "deleteme-alias", &alias_emb)?;
+
+        // Count mnemonic_vectors before delete
+        let before: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM mnemonic_vectors", [], |row| row.get(0),
+        )?;
+        assert!(before >= 2);
+
+        store.delete_memory("deleteme")?;
+
+        // All mnemonic_vectors should be cleaned up
+        let after: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM mnemonic_vectors", [], |row| row.get(0),
+        )?;
+        assert_eq!(after, 0, "mnemonic_vectors should be cleaned up after delete");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_migration_idempotent() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        store.memorize("idempotent", "content", &[], &emb)?;
+
+        // Run migrate again — should not error
+        store.migrate()?;
+        store.migrate()?;
+
+        // Data should still be intact
+        let mem = store.get_memory_by_mnemonic("idempotent")?.unwrap();
+        assert_eq!(mem.content, "content");
+        assert!(!mem.mnemonics.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_edit_memory_add_remove_mnemonics() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        let alias1_emb: Vec<f32> = vec![0.2; 384];
+        let alias2_emb: Vec<f32> = vec![0.3; 384];
+
+        store.memorize("editable", "content", &["tag".into()], &emb)?;
+
+        let result = store.edit_memory(
+            "editable",
+            None,      // no rename
+            &[],       // no add tags
+            &[],       // no remove tags
+            None,      // no re-embed
+            &["alias1".into(), "alias2".into()],
+            &[],
+            &[alias1_emb.clone(), alias2_emb.clone()],
+        )?;
+
+        assert_eq!(result.mnemonics.len(), 3); // editable, alias1, alias2
+        assert!(result.mnemonics.contains(&"alias1".to_string()));
+        assert!(result.mnemonics.contains(&"alias2".to_string()));
+
+        // Now remove one
+        let result = store.edit_memory(
+            "editable",
+            None, &[], &[], None,
+            &[],
+            &["alias1".into()],
+            &[],
+        )?;
+
+        assert_eq!(result.mnemonics.len(), 2);
+        assert!(!result.mnemonics.contains(&"alias1".to_string()));
+        assert!(result.mnemonics.contains(&"alias2".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_memorize_populates_mnemonics() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        store.memorize("single", "content", &[], &emb)?;
+
+        // get_memory_by_mnemonic should populate mnemonics
+        let mem = store.get_memory_by_mnemonic("single")?.unwrap();
+        assert_eq!(mem.mnemonics, vec!["single"]);
+
+        // recall should also populate mnemonics
+        let results = store.recall(&emb, 5, None, None, None)?;
+        assert_eq!(results[0].mnemonics, vec!["single"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_all_summaries_has_mnemonics() -> Result<()> {
+        let store = MemoryStore::in_memory()?;
+        let emb: Vec<f32> = vec![0.1; 384];
+        let alias_emb: Vec<f32> = vec![0.2; 384];
+
+        store.memorize("summary-test", "content", &[], &emb)?;
+        store.add_mnemonic("summary-test", "summary-alias", &alias_emb)?;
+
+        let summaries = store.list_all_summaries()?;
+        let s = summaries.iter().find(|s| s.mnemonic == "summary-test").unwrap();
+        assert_eq!(s.mnemonics.len(), 2);
 
         Ok(())
     }

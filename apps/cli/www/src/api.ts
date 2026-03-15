@@ -2,6 +2,7 @@ export interface MemorySummary {
   mnemonic: string
   content: string
   tags: string[]
+  mnemonics?: string[]
   recall_count: number
 }
 
@@ -9,6 +10,7 @@ export interface Memory {
   mnemonic: string
   content: string
   tags: string[]
+  mnemonics?: string[]
   distance: number
   score: number
   updated_at: string
@@ -33,6 +35,7 @@ export interface GraphNode {
   mnemonic: string
   content: string
   tags: string[]
+  mnemonics?: string[]
   recall_count: number
 }
 
@@ -113,5 +116,19 @@ export const api = {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source, target, link_type }),
+    }).then(r => json<{ ok: boolean }>(r)),
+
+  addMnemonic: (title: string, text: string) =>
+    fetch(`/api/memories/${enc(title)}/mnemonics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    }).then(r => json<{ ok: boolean }>(r)),
+
+  removeMnemonic: (title: string, text: string) =>
+    fetch(`/api/memories/${enc(title)}/mnemonics`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
     }).then(r => json<{ ok: boolean }>(r)),
 }

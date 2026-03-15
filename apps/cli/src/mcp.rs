@@ -64,6 +64,12 @@ struct EditInput {
     /// Tags to remove
     #[serde(default)]
     remove_tags: Vec<String>,
+    /// Additional mnemonic aliases to add (each gets its own embedding for recall)
+    #[serde(default)]
+    add_mnemonics: Vec<String>,
+    /// Mnemonic aliases to remove
+    #[serde(default)]
+    remove_mnemonics: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,6 +178,15 @@ fn format_memories(memories: &[Memory], truncate: Option<usize>) -> String {
         ));
         if !mem.tags.is_empty() {
             output.push_str(&format!("   tags: {}\n", mem.tags.join(", ")));
+        }
+        if mem.mnemonics.len() > 1 {
+            let aliases: Vec<&str> = mem.mnemonics.iter()
+                .filter(|m| m.as_str() != mem.mnemonic)
+                .map(|m| m.as_str())
+                .collect();
+            if !aliases.is_empty() {
+                output.push_str(&format!("   aliases: {}\n", aliases.join(", ")));
+            }
         }
         if !mem.links.is_empty() {
             let link_strs: Vec<String> = mem
@@ -416,21 +431,31 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let app = state.clone();
     let edit = ToolBuilder::new("edit")
-        .description("Edit an existing memory's mnemonic or tags. Use to disambiguate colliding mnemonics or fix tag assignments. If the mnemonic is changed, the memory will be re-embedded.")
+        .description("Edit an existing memory's mnemonic or tags. Use to disambiguate colliding mnemonics or fix tag assignments. If the mnemonic is changed, the memory will be re-embedded. Use add_mnemonics/remove_mnemonics to manage additional aliases — each alias gets its own embedding vector for improved recall coverage.")
         .handler(move |input: EditInput| {
             let app = app.clone();
             async move {
-                if input.new_mnemonic.is_none() && input.add_tags.is_empty() && input.remove_tags.is_empty() {
-                    return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags"))
+                if input.new_mnemonic.is_none() && input.add_tags.is_empty() && input.remove_tags.is_empty()
+                    && input.add_mnemonics.is_empty() && input.remove_mnemonics.is_empty() {
+                    return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags, add_mnemonics, remove_mnemonics"))
                         .tool_context("edit failed");
                 }
+                let embedder = app.embedder.lock().await;
                 let new_embedding = match &input.new_mnemonic {
                     Some(mn) => Some(
-                        app.embedder.lock().await.embed(mn)
-                            .tool_context("embedding failed")?
+                        embedder.embed(mn).tool_context("embedding failed")?
                     ),
                     None => None,
                 };
+                // Embed each new mnemonic alias
+                let mut mnemonic_embeddings: Vec<Vec<f32>> = Vec::new();
+                for mn in &input.add_mnemonics {
+                    mnemonic_embeddings.push(
+                        embedder.embed(mn).tool_context("embedding failed")?
+                    );
+                }
+                drop(embedder);
+
                 let result = app.store.lock().await
                     .edit_memory(
                         &input.mnemonic,
@@ -438,6 +463,9 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                         &input.add_tags,
                         &input.remove_tags,
                         new_embedding.as_deref(),
+                        &input.add_mnemonics,
+                        &input.remove_mnemonics,
+                        &mnemonic_embeddings,
                     )
                     .tool_context("edit failed")?;
 
@@ -448,6 +476,9 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                 };
                 if !result.tags.is_empty() {
                     output.push_str(&format!("\nTags: [{}]", result.tags.join(", ")));
+                }
+                if result.mnemonics.len() > 1 {
+                    output.push_str(&format!("\nMnemonics: [{}]", result.mnemonics.join(", ")));
                 }
                 Ok(CallToolResult::text(output))
             }
@@ -473,7 +504,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 
     let router = McpRouter::new()
         .server_info("trivia", "0.1.0")
-        .instructions("Semantic memory store. Memories are keyed by a short mnemonic (a concept name, file path, or phrase) and hold longer-form content. The mnemonic is what gets embedded for vector search; content is searched via full-text keyword match.\n\nTypical workflow: `recall` before starting work to load relevant context, `memorize` to save new facts, `rate` results after using them so ranking improves over time. Very similar mnemonics are auto-merged on memorize (distance < 0.15) and auto-linked (distance < 0.30).\n\nUse `edit` to rename mnemonics that collide in recall. Use `merge` when two memories cover the same topic. Use `link` to create explicit relationships between distinct memories.")
+        .instructions("Semantic memory store. Memories are keyed by a short mnemonic (a concept name, file path, or phrase) and hold longer-form content. The mnemonic is what gets embedded for vector search; content is searched via full-text keyword match.\n\nTypical workflow: `recall` before starting work to load relevant context, `memorize` to save new facts, `rate` results after using them so ranking improves over time. Very similar mnemonics are auto-merged on memorize (distance < 0.15) and auto-linked (distance < 0.30).\n\nUse `edit` to rename mnemonics that collide in recall. Use `merge` when two memories cover the same topic. Use `link` to create explicit relationships between distinct memories.\n\nMemories can have multiple mnemonic aliases via `edit`'s `add_mnemonics`/`remove_mnemonics` parameters. Each alias gets its own embedding vector, increasing recall surface area when different phrasings are used.")
         .tool(memorize)
         .tool(recall)
         .tool(rate)

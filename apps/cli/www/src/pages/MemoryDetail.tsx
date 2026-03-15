@@ -22,6 +22,7 @@ export function MemoryDetail() {
   const [tagsStr, setTagsStr] = useState('')
   const [showDelete, setShowDelete] = useState(false)
   const [showLink, setShowLink] = useState(false)
+  const [newAlias, setNewAlias] = useState('')
 
   const startEdit = () => {
     if (!memory) return
@@ -54,6 +55,19 @@ export function MemoryDetail() {
   const unlinkMutation = useMutation({
     mutationFn: (args: { source: string; target: string; link_type: string }) =>
       api.removeLink(args.source, args.target, args.link_type),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memory', decodedMnemonic] }),
+  })
+
+  const addAliasMutation = useMutation({
+    mutationFn: (text: string) => api.addMnemonic(decodedMnemonic, text),
+    onSuccess: () => {
+      setNewAlias('')
+      queryClient.invalidateQueries({ queryKey: ['memory', decodedMnemonic] })
+    },
+  })
+
+  const removeAliasMutation = useMutation({
+    mutationFn: (text: string) => api.removeMnemonic(decodedMnemonic, text),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memory', decodedMnemonic] }),
   })
 
@@ -129,6 +143,38 @@ export function MemoryDetail() {
                 ))}
               </div>
             )}
+            {(memory.mnemonics && memory.mnemonics.length > 1) && (
+              <div>
+                <span className="text-xs font-semibold text-gray-500">Aliases: </span>
+                <div className="flex gap-1.5 flex-wrap mt-1">
+                  {memory.mnemonics.filter(m => m !== memory.mnemonic).map(m => (
+                    <span key={m} className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded text-xs flex items-center gap-1">
+                      {m}
+                      <button
+                        onClick={() => removeAliasMutation.mutate(m)}
+                        className="text-blue-400 hover:text-red-500"
+                        title="Remove alias"
+                      >&times;</button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="flex gap-1.5 items-center">
+              <input
+                type="text"
+                value={newAlias}
+                onChange={e => setNewAlias(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && newAlias.trim()) addAliasMutation.mutate(newAlias.trim()) }}
+                placeholder="Add alias..."
+                className="border rounded px-2 py-0.5 text-xs w-48 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              />
+              <button
+                onClick={() => { if (newAlias.trim()) addAliasMutation.mutate(newAlias.trim()) }}
+                disabled={!newAlias.trim() || addAliasMutation.isPending}
+                className="text-xs text-blue-600 hover:text-blue-800 disabled:opacity-30"
+              >+ Add</button>
+            </div>
             <div className="text-xs text-gray-400 space-x-4">
               <span>Updated: {memory.updated_at}</span>
               <span>Recalls: {memory.recall_count}</span>

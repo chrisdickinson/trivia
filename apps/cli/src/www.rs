@@ -36,7 +36,7 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
     }
 }
 
-pub async fn serve(store: MemoryStore, embedder: Embedder, port: u16) -> Result<()> {
+pub async fn serve(store: MemoryStore, embedder: Embedder, bind_addr: &str) -> Result<()> {
     let state = Arc::new(AppState {
         store: tokio::sync::Mutex::new(store),
         embedder: tokio::sync::Mutex::new(embedder),
@@ -53,15 +53,19 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, port: u16) -> Result<
         .route("/api/graph", get(get_graph))
         .route("/api/search", get(search_memories))
         .route("/api/tags", get(list_tags))
-        .route("/api/links", post(create_link).delete(remove_link));
+        .route("/api/links", post(create_link).delete(remove_link))
+        .route(
+            "/api/memories/{mnemonic}/mnemonics",
+            post(add_mnemonic_handler).delete(remove_mnemonic_handler),
+        );
 
     let app = api
         .fallback(get(static_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    eprintln!("Listening on http://localhost:{port}");
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    eprintln!("Listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -178,6 +182,8 @@ struct GraphNode {
     mnemonic: String,
     content: String,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mnemonics: Vec<String>,
     recall_count: i64,
     useful_count: i64,
     not_useful_count: i64,
@@ -201,6 +207,7 @@ async fn get_graph(State(state): State<Arc<AppState>>) -> AppResult<impl IntoRes
             mnemonic: s.mnemonic,
             content: s.content,
             tags: s.tags,
+            mnemonics: s.mnemonics,
             recall_count: s.recall_count,
             useful_count: s.useful_count,
             not_useful_count: s.not_useful_count,
@@ -300,6 +307,34 @@ async fn remove_link(
 ) -> AppResult<impl IntoResponse> {
     let store = state.store.lock().await;
     store.unlink(&body.source, &body.target, &body.link_type)?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct MnemonicReq {
+    text: String,
+}
+
+async fn add_mnemonic_handler(
+    State(state): State<Arc<AppState>>,
+    Path(title): Path<String>,
+    axum::Json(body): axum::Json<MnemonicReq>,
+) -> AppResult<impl IntoResponse> {
+    let embedder = state.embedder.lock().await;
+    let embedding = embedder.embed(&body.text)?;
+    drop(embedder);
+    let store = state.store.lock().await;
+    store.add_mnemonic(&title, &body.text, &embedding)?;
+    Ok((StatusCode::CREATED, axum::Json(serde_json::json!({"ok": true}))))
+}
+
+async fn remove_mnemonic_handler(
+    State(state): State<Arc<AppState>>,
+    Path(title): Path<String>,
+    axum::Json(body): axum::Json<MnemonicReq>,
+) -> AppResult<impl IntoResponse> {
+    let store = state.store.lock().await;
+    store.remove_mnemonic(&title, &body.text)?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 

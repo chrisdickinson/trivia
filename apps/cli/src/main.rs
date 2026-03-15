@@ -91,16 +91,26 @@ enum Command {
     /// Start MCP server (stdin/stdout JSON-RPC)
     Mcp,
     /// Start web UI server
-    Www {
-        /// Port to listen on
-        #[arg(long, short, default_value_t = 3000)]
-        port: u16,
-    },
+    Www,
     /// List all unique tags with memory counts
     ListTags {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Add an alias mnemonic to a memory
+    AddMnemonic {
+        /// Title (primary mnemonic) of the memory
+        title: String,
+        /// Alias text to add
+        alias: String,
+    },
+    /// Remove an alias mnemonic from a memory
+    RemoveMnemonic {
+        /// Title (primary mnemonic) of the memory
+        title: String,
+        /// Alias text to remove
+        alias: String,
     },
     /// Find and interactively merge similar memories
     Automerge {
@@ -202,6 +212,15 @@ fn main() -> Result<()> {
                     if !mem.tags.is_empty() {
                         println!("   tags: {}", mem.tags.join(", "));
                     }
+                    if mem.mnemonics.len() > 1 {
+                        let aliases: Vec<&str> = mem.mnemonics.iter()
+                            .filter(|m| m.as_str() != mem.mnemonic)
+                            .map(|m| m.as_str())
+                            .collect();
+                        if !aliases.is_empty() {
+                            println!("   aliases: {}", aliases.join(", "));
+                        }
+                    }
                     if !mem.links.is_empty() {
                         let link_strs: Vec<String> = mem
                             .links
@@ -284,9 +303,11 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(mcp::serve(store, embedder, config))?;
         }
-        Command::Www { port } => {
+        Command::Www => {
+            let bind_addr = std::env::var("BIND_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(www::serve(store, embedder, port))?;
+            rt.block_on(www::serve(store, embedder, &bind_addr))?;
         }
         Command::ListTags { json } => {
             let tags = store.list_tags()?;
@@ -299,6 +320,15 @@ fn main() -> Result<()> {
                     println!("{} ({} memories)", t.tag, t.count);
                 }
             }
+        }
+        Command::AddMnemonic { title, alias } => {
+            let embedding = embedder.embed(&alias)?;
+            store.add_mnemonic(&title, &alias, &embedding)?;
+            eprintln!("Added mnemonic alias \"{alias}\" to \"{title}\"");
+        }
+        Command::RemoveMnemonic { title, alias } => {
+            store.remove_mnemonic(&title, &alias)?;
+            eprintln!("Removed mnemonic alias \"{alias}\" from \"{title}\"");
         }
         Command::Automerge {
             threshold,

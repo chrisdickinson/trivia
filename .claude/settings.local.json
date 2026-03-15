@@ -4,7 +4,9 @@
       "WebSearch",
       "Bash(cargo build:*)",
       "mcp__plugin_trivia_trivia__memorize",
-      "mcp__trivia__memorize"
+      "mcp__trivia__memorize",
+      "mcp__trivia__recall",
+      "mcp__plugin_trivia_trivia__recall"
     ]
   },
   "enableAllProjectMcpServers": true,
