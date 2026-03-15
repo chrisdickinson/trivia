@@ -9,10 +9,13 @@ use tower_mcp::transport::stdio::StdioTransport;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
 use trivia_core::{Embedder, Memory, MemoryStore, MemorizeResult, TriviaConfig};
 
+use crate::acl::Acl;
+
 struct AppState {
-    store: Mutex<MemoryStore>,
-    embedder: Mutex<Embedder>,
+    store: Arc<Mutex<MemoryStore>>,
+    embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
+    acl: Arc<Acl>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -223,13 +226,41 @@ fn format_memories(memories: &[Memory], truncate: Option<usize>) -> String {
     output
 }
 
+/// Helper: look up a memory's tags by mnemonic. Returns None if not found.
+async fn memory_tags(store: &Arc<Mutex<MemoryStore>>, mnemonic: &str) -> Result<Option<Vec<String>>> {
+    let s = store.lock().await;
+    match s.get_memory_by_mnemonic(mnemonic)? {
+        Some(mem) => Ok(Some(mem.tags)),
+        None => Ok(None),
+    }
+}
+
+/// Build the MCP router with ACL enforcement.
+pub fn build_mcp_router(
+    store: Arc<Mutex<MemoryStore>>,
+    embedder: Arc<Mutex<Embedder>>,
+    config: TriviaConfig,
+    acl: Arc<Acl>,
+) -> McpRouter {
+    let state = Arc::new(AppState { store, embedder, config, acl });
+    build_router(state)
+}
+
+/// Serve MCP over stdio (no ACL restrictions).
 pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig) -> Result<()> {
     let state = Arc::new(AppState {
-        store: Mutex::new(store),
-        embedder: Mutex::new(embedder),
+        store: Arc::new(Mutex::new(store)),
+        embedder: Arc::new(Mutex::new(embedder)),
         config,
+        acl: Arc::new(Acl::open()),
     });
 
+    let router = build_router(state);
+    StdioTransport::new(router).run().await?;
+    Ok(())
+}
+
+fn build_router(state: Arc<AppState>) -> McpRouter {
     let app = state.clone();
     let memorize = ToolBuilder::new("memorize")
         .description("Store a fact or context for later recall. Use a mnemonic (file path, concept, phrase) plus the content to remember. Good examples include \"project design\"; \"feedback on src/files/foo.rs\"; \"implementation of the Frobnicator Component\". You're looking to capture what the memory was about with the mnemonic rather than the content of the memory. Mnemonics that are very similar to existing ones may be auto-merged. The response will note nearby memories and warn about close collisions.")
@@ -237,10 +268,21 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
             let app = app.clone();
             async move {
                 let tags = TriviaConfig::merge_tags(&app.config.memorize.tags, &input.tags);
+
+                // ACL: at least one tag must grant update
+                if !app.acl.is_open() && !app.acl.check_update(&tags) {
+                    return Err(anyhow::anyhow!(
+                        "access denied: none of the tags [{}] grant update access",
+                        tags.join(", ")
+                    ))
+                    .tool_context("memorize denied");
+                }
+
+                let skip_merge = !app.acl.is_open();
                 let embedding = app.embedder.lock().await.embed(&input.mnemonic)
                     .tool_context("embedding failed")?;
                 let result = app.store.lock().await
-                    .memorize(&input.mnemonic, &input.content, &tags, &embedding)
+                    .memorize_with_options(&input.mnemonic, &input.content, &tags, &embedding, skip_merge)
                     .tool_context("memorize failed")?;
                 Ok(CallToolResult::text(format_memorize_response(&input.mnemonic, &result)))
             }
@@ -262,6 +304,11 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                 let mut memories = app.store.lock().await
                     .recall(&embedding, limit, tags, fts, exclude)
                     .tool_context("recall failed")?;
+
+                // ACL: post-filter by read access
+                if !app.acl.is_open() {
+                    memories.retain(|m| app.acl.check_read(&m.tags));
+                }
 
                 // Apply min_score: param > config > 0.0
                 let min_score = input.min_score
@@ -297,6 +344,20 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                         .tool_context("rate failed");
                 }
 
+                // ACL: each memory must grant update
+                if !app.acl.is_open() {
+                    for mn in &all {
+                        if let Some(tags) = memory_tags(&app.store, mn).await
+                            .tool_context("rate failed")? {
+                            if !app.acl.check_update(&tags) {
+                                return Err(anyhow::anyhow!(
+                                    "access denied: memory \"{}\" does not grant update access", mn
+                                )).tool_context("rate denied");
+                            }
+                        }
+                    }
+                }
+
                 let not_found = app.store
                     .lock()
                     .await
@@ -322,6 +383,20 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         .handler(move |input: LinkInput| {
             let app = app.clone();
             async move {
+                // ACL: both memories must grant update
+                if !app.acl.is_open() {
+                    for mn in [&input.source, &input.target] {
+                        if let Some(tags) = memory_tags(&app.store, mn).await
+                            .tool_context("link failed")? {
+                            if !app.acl.check_update(&tags) {
+                                return Err(anyhow::anyhow!(
+                                    "access denied: memory \"{}\" does not grant update access", mn
+                                )).tool_context("link denied");
+                            }
+                        }
+                    }
+                }
+
                 app.store
                     .lock()
                     .await
@@ -341,6 +416,20 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         .handler(move |input: MergeInput| {
             let app = app.clone();
             async move {
+                // ACL: both memories must grant update
+                if !app.acl.is_open() {
+                    for mn in [&input.keep, &input.discard] {
+                        if let Some(tags) = memory_tags(&app.store, mn).await
+                            .tool_context("merge failed")? {
+                            if !app.acl.check_update(&tags) {
+                                return Err(anyhow::anyhow!(
+                                    "access denied: memory \"{}\" does not grant update access", mn
+                                )).tool_context("merge denied");
+                            }
+                        }
+                    }
+                }
+
                 let embedding = app
                     .embedder
                     .lock()
@@ -368,25 +457,37 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
             async move {
                 let dir = std::path::Path::new(&input.directory);
                 let tags = input.tags.as_deref();
-                app.store
-                    .lock()
-                    .await
-                    .export(dir, tags)
-                    .tool_context("export failed")?;
-                Ok(CallToolResult::text(format!(
-                    "Exported to: {}",
-                    input.directory
-                )))
+
+                if app.acl.is_open() {
+                    app.store.lock().await
+                        .export(dir, tags)
+                        .tool_context("export failed")?;
+                } else {
+                    // ACL: only export readable memories
+                    app.store.lock().await
+                        .export_filtered(dir, tags, |mem_tags| app.acl.check_read(mem_tags))
+                        .tool_context("export failed")?;
+                }
+
+                Ok(CallToolResult::text(format!("Exported to: {}", input.directory)))
             }
         })
         .build();
 
     let app = state.clone();
+    let acl_for_import = app.acl.clone();
     let import = ToolBuilder::new("import")
         .description("Import memories from a directory of markdown files with YAML frontmatter.")
         .handler(move |input: ImportInput| {
             let app = app.clone();
+            let acl = acl_for_import.clone();
             async move {
+                // ACL: import is blocked in shared mode
+                if !acl.is_open() {
+                    return Err(anyhow::anyhow!("import is disabled in shared mode"))
+                        .tool_context("import denied");
+                }
+
                 let dir = std::path::Path::new(&input.directory);
                 let embedder = app.embedder.lock().await;
                 let result = app
@@ -416,6 +517,15 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                     .list_tags()
                     .tool_context("list-tags failed")?;
 
+                // ACL: post-filter by read access
+                let tags: Vec<_> = if app.acl.is_open() {
+                    tags
+                } else {
+                    tags.into_iter()
+                        .filter(|t| app.acl.tag_level(&t.tag) >= crate::acl::AccessLevel::Read)
+                        .collect()
+                };
+
                 if tags.is_empty() {
                     return Ok(CallToolResult::text("No tags found."));
                 }
@@ -440,6 +550,20 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
                     return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags, add_mnemonics, remove_mnemonics"))
                         .tool_context("edit failed");
                 }
+
+                // ACL: memory's current tags must grant update
+                if !app.acl.is_open() {
+                    if let Some(tags) = memory_tags(&app.store, &input.mnemonic).await
+                        .tool_context("edit failed")? {
+                        if !app.acl.check_update(&tags) {
+                            return Err(anyhow::anyhow!(
+                                "access denied: memory \"{}\" does not grant update access",
+                                input.mnemonic
+                            )).tool_context("edit denied");
+                        }
+                    }
+                }
+
                 let embedder = app.embedder.lock().await;
                 let new_embedding = match &input.new_mnemonic {
                     Some(mn) => Some(
@@ -491,6 +615,22 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         .handler(move |input: RenameTagInput| {
             let app = app.clone();
             async move {
+                // ACL: both old and new tag must grant update
+                if !app.acl.is_open() {
+                    if app.acl.tag_level(&input.old_tag) < crate::acl::AccessLevel::Update {
+                        return Err(anyhow::anyhow!(
+                            "access denied: tag \"{}\" does not grant update access",
+                            input.old_tag
+                        )).tool_context("rename-tag denied");
+                    }
+                    if app.acl.tag_level(&input.new_tag) < crate::acl::AccessLevel::Update {
+                        return Err(anyhow::anyhow!(
+                            "access denied: tag \"{}\" does not grant update access",
+                            input.new_tag
+                        )).tool_context("rename-tag denied");
+                    }
+                }
+
                 let count = app.store.lock().await
                     .rename_tag(&input.old_tag, &input.new_tag)
                     .tool_context("rename-tag failed")?;
@@ -502,7 +642,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         })
         .build();
 
-    let router = McpRouter::new()
+    McpRouter::new()
         .server_info("trivia", "0.1.0")
         .instructions("Semantic memory store. Memories are keyed by a short mnemonic (a concept name, file path, or phrase) and hold longer-form content. The mnemonic is what gets embedded for vector search; content is searched via full-text keyword match.\n\nTypical workflow: `recall` before starting work to load relevant context, `memorize` to save new facts, `rate` results after using them so ranking improves over time. Very similar mnemonics are auto-merged on memorize (distance < 0.15) and auto-linked (distance < 0.30).\n\nUse `edit` to rename mnemonics that collide in recall. Use `merge` when two memories cover the same topic. Use `link` to create explicit relationships between distinct memories.\n\nMemories can have multiple mnemonic aliases via `edit`'s `add_mnemonics`/`remove_mnemonics` parameters. Each alias gets its own embedding vector, increasing recall surface area when different phrasings are used.")
         .tool(memorize)
@@ -514,10 +654,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         .tool(rename_tag)
         .tool(export)
         .tool(import)
-        .tool(list_tags);
-
-    StdioTransport::new(router).run().await?;
-    Ok(())
+        .tool(list_tags)
 }
 
 #[cfg(test)]

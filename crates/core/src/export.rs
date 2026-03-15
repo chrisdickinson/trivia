@@ -187,6 +187,129 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Like `export`, but applies an additional filter predicate on each memory's tags.
+    /// Only memories for which `filter(&tags)` returns true are exported.
+    pub fn export_filtered(
+        &self,
+        dir: &Path,
+        tags: Option<&[String]>,
+        filter: impl Fn(&[String]) -> bool,
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+
+        // Query memories (optionally pre-filtered by tags)
+        let rows: Vec<ExportRow> = match tags {
+            Some(filter_tags) if !filter_tags.is_empty() => {
+                let placeholders: Vec<String> =
+                    (1..=filter_tags.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT DISTINCT m.id, m.uuid, m.title, m.content, m.tags
+                     FROM memories m, json_each(m.tags) je
+                     WHERE je.value IN ({})
+                     ORDER BY m.title",
+                    placeholders.join(", ")
+                );
+                let mut stmt = self.conn().prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::types::ToSql> = filter_tags
+                    .iter()
+                    .map(|t| t as &dyn rusqlite::types::ToSql)
+                    .collect();
+                stmt.query_map(params.as_slice(), |row| {
+                    Ok(ExportRow {
+                        memory_id: row.get(0)?,
+                        uuid: row.get(1)?,
+                        title: row.get(2)?,
+                        content: row.get(3)?,
+                        tags_json: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            _ => {
+                let mut stmt = self.conn().prepare(
+                    "SELECT id, uuid, title, content, tags FROM memories ORDER BY title",
+                )?;
+                stmt.query_map([], |row| {
+                    Ok(ExportRow {
+                        memory_id: row.get(0)?,
+                        uuid: row.get(1)?,
+                        title: row.get(2)?,
+                        content: row.get(3)?,
+                        tags_json: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+        };
+
+        // Apply ACL filter
+        let rows: Vec<ExportRow> = rows
+            .into_iter()
+            .filter(|row| {
+                let mem_tags: Vec<String> =
+                    serde_json::from_str(&row.tags_json).unwrap_or_default();
+                filter(&mem_tags)
+            })
+            .collect();
+
+        let exported_uuids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.uuid.as_str()).collect();
+
+        let mut link_stmt = self.conn().prepare(
+            "SELECT s_mem.uuid, t_mem.uuid, ml.link_type
+             FROM memory_links ml
+             JOIN memories s_mem ON s_mem.id = ml.source_id
+             JOIN memories t_mem ON t_mem.id = ml.target_id",
+        )?;
+        let link_rows: Vec<ExportLinkRow> = link_stmt
+            .query_map([], |row| {
+                Ok(ExportLinkRow {
+                    source_uuid: row.get(0)?,
+                    target_uuid: row.get(1)?,
+                    link_type: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|l| {
+                exported_uuids.contains(l.source_uuid.as_str())
+                    && exported_uuids.contains(l.target_uuid.as_str())
+            })
+            .collect();
+
+        for row in &rows {
+            let tags: Vec<String> = serde_json::from_str(&row.tags_json).unwrap_or_default();
+            let mnemonics: Vec<String> =
+                MemoryStore::get_mnemonics_for_memory(self.conn(), row.memory_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| m != &row.title)
+                    .collect();
+            let links: Vec<ExportLink> = link_rows
+                .iter()
+                .filter(|l| l.source_uuid == row.uuid)
+                .map(|l| ExportLink {
+                    target: l.target_uuid.clone(),
+                    link_type: l.link_type.clone(),
+                })
+                .collect();
+
+            let fm = Frontmatter {
+                uuid: row.uuid.clone(),
+                mnemonic: row.title.clone(),
+                mnemonics,
+                tags,
+                links,
+            };
+            let yaml = serde_norway::to_string(&fm)?;
+            let file_content = format!("---\n{yaml}---\n\n{}", row.content);
+            let filename = format!("{}.md", slugify(&row.title));
+            std::fs::write(dir.join(&filename), file_content)?;
+        }
+
+        Ok(())
+    }
+
     pub fn import(&self, dir: &Path, embedder: &Embedder) -> Result<ImportResult> {
         if !dir.is_dir() {
             return Err(anyhow!("not a directory: {}", dir.display()));

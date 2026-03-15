@@ -434,6 +434,30 @@ impl MemoryStore {
         tags: &[String],
         embedding: &[f32],
     ) -> Result<MemorizeResult> {
+        self.memorize_inner(mnemonic, content, tags, embedding, false)
+    }
+
+    /// Like `memorize`, but when `skip_merge` is true, suppresses auto-merge
+    /// and neighbor distance info (for shared/ACL-gated access).
+    pub fn memorize_with_options(
+        &self,
+        mnemonic: &str,
+        content: &str,
+        tags: &[String],
+        embedding: &[f32],
+        skip_merge: bool,
+    ) -> Result<MemorizeResult> {
+        self.memorize_inner(mnemonic, content, tags, embedding, skip_merge)
+    }
+
+    fn memorize_inner(
+        &self,
+        mnemonic: &str,
+        content: &str,
+        tags: &[String],
+        embedding: &[f32],
+        skip_merge: bool,
+    ) -> Result<MemorizeResult> {
         let tags_json = serde_json::to_string(tags)?;
 
         let tx = self.conn.unchecked_transaction()?;
@@ -530,111 +554,27 @@ impl MemoryStore {
             .map(|(mid, _, dist, title, tags)| (mid, dist, title, tags))
             .collect();
 
-        // Collect neighbor info for the result (within AUTO_LINK_THRESHOLD)
-        let result_neighbors: Vec<MemorizeNeighbor> = deduped
-            .iter()
-            .filter(|(_, dist, _, _)| *dist < AUTO_LINK_THRESHOLD)
-            .map(|(_, dist, title, tags_json)| {
-                let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
-                MemorizeNeighbor {
-                    mnemonic: title.clone(),
-                    distance: *dist,
-                    tags,
-                }
-            })
-            .collect();
-
-        // Check for auto-merge candidate (closest neighbor below merge threshold)
-        let merge_candidate: Option<(i64, String, String, String)> = deduped
-            .iter()
-            .filter(|(_, dist, _, _)| *dist < AUTO_MERGE_THRESHOLD)
-            .next()
-            .map(|(mid, _, _, _)| {
-                tx.query_row(
-                    "SELECT id, title, content, tags FROM memories WHERE id = ?1",
-                    params![mid],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    },
-                )
-            })
-            .transpose()?;
-
-        let merged_with = if let Some((old_id, ref old_title, old_content, old_tags_json)) = merge_candidate {
-            // Concatenate content: new + old
-            let merged_content = format!("{content}\n\n{old_content}");
-            // Union tags
-            let old_tags: Vec<String> =
-                serde_json::from_str(&old_tags_json).unwrap_or_default();
-            let mut merged_tags: Vec<String> = tags.to_vec();
-            for t in old_tags {
-                if !merged_tags.contains(&t) {
-                    merged_tags.push(t);
-                }
-            }
-            let merged_tags_json = serde_json::to_string(&merged_tags)?;
-
-            // Update the new memory with merged content and tags
-            tx.execute(
-                "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
-                params![merged_content, merged_tags_json, memory_id],
-            )?;
-
-            // Transfer mnemonics from old to new
-            // First delete mnemonic_vectors for old memory's mnemonics
-            tx.execute(
-                "DELETE FROM mnemonic_vectors WHERE mnemonic_id IN (SELECT id FROM mnemonics WHERE memory_id = ?1)",
-                params![old_id],
-            )?;
-            // Transfer mnemonics rows
-            tx.execute(
-                "UPDATE OR IGNORE mnemonics SET memory_id = ?1 WHERE memory_id = ?2",
-                params![memory_id, old_id],
-            )?;
-            // Delete any orphaned mnemonics that conflicted
-            tx.execute(
-                "DELETE FROM mnemonics WHERE memory_id = ?1",
-                params![old_id],
-            )?;
-
-            // Transfer links from old to new
-            tx.execute(
-                "UPDATE OR IGNORE memory_links SET source_id = ?1 WHERE source_id = ?2",
-                params![memory_id, old_id],
-            )?;
-            tx.execute(
-                "UPDATE OR IGNORE memory_links SET target_id = ?1 WHERE target_id = ?2",
-                params![memory_id, old_id],
-            )?;
-            // Clean up any self-links created by transfer
-            tx.execute(
-                "DELETE FROM memory_links WHERE source_id = target_id",
-                [],
-            )?;
-
-            // Create supersedes link
-            tx.execute(
-                "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type) VALUES (?1, ?2, 'supersedes')",
-                params![memory_id, old_id],
-            )?;
-
-            // Delete old memory_vectors
-            tx.execute(
-                "DELETE FROM memory_vectors WHERE memory_id = ?1",
-                params![old_id],
-            )?;
-
-            // Delete old memory (CASCADE handles remaining)
-            tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
-
-            Some(old_title.clone())
+        // When skip_merge is set (shared/ACL mode), suppress neighbor info and
+        // skip auto-merge to prevent probing via distance values.
+        let result_neighbors: Vec<MemorizeNeighbor> = if skip_merge {
+            Vec::new()
         } else {
-            // No merge — just auto-link
+            deduped
+                .iter()
+                .filter(|(_, dist, _, _)| *dist < AUTO_LINK_THRESHOLD)
+                .map(|(_, dist, title, tags_json)| {
+                    let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+                    MemorizeNeighbor {
+                        mnemonic: title.clone(),
+                        distance: *dist,
+                        tags,
+                    }
+                })
+                .collect()
+        };
+
+        let merged_with = if skip_merge {
+            // Skip auto-merge, but still auto-link
             for (neighbor_mid, dist, _, _) in &deduped {
                 if *dist < AUTO_LINK_THRESHOLD {
                     tx.execute(
@@ -645,6 +585,109 @@ impl MemoryStore {
                 }
             }
             None
+        } else {
+            // Check for auto-merge candidate (closest neighbor below merge threshold)
+            let merge_candidate: Option<(i64, String, String, String)> = deduped
+                .iter()
+                .filter(|(_, dist, _, _)| *dist < AUTO_MERGE_THRESHOLD)
+                .next()
+                .map(|(mid, _, _, _)| {
+                    tx.query_row(
+                        "SELECT id, title, content, tags FROM memories WHERE id = ?1",
+                        params![mid],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                })
+                .transpose()?;
+
+            if let Some((old_id, ref old_title, old_content, old_tags_json)) = merge_candidate {
+                // Concatenate content: new + old
+                let merged_content = format!("{content}\n\n{old_content}");
+                // Union tags
+                let old_tags: Vec<String> =
+                    serde_json::from_str(&old_tags_json).unwrap_or_default();
+                let mut merged_tags: Vec<String> = tags.to_vec();
+                for t in old_tags {
+                    if !merged_tags.contains(&t) {
+                        merged_tags.push(t);
+                    }
+                }
+                let merged_tags_json = serde_json::to_string(&merged_tags)?;
+
+                // Update the new memory with merged content and tags
+                tx.execute(
+                    "UPDATE memories SET content = ?1, tags = ?2, updated_at = datetime('now') WHERE id = ?3",
+                    params![merged_content, merged_tags_json, memory_id],
+                )?;
+
+                // Transfer mnemonics from old to new
+                // First delete mnemonic_vectors for old memory's mnemonics
+                tx.execute(
+                    "DELETE FROM mnemonic_vectors WHERE mnemonic_id IN (SELECT id FROM mnemonics WHERE memory_id = ?1)",
+                    params![old_id],
+                )?;
+                // Transfer mnemonics rows
+                tx.execute(
+                    "UPDATE OR IGNORE mnemonics SET memory_id = ?1 WHERE memory_id = ?2",
+                    params![memory_id, old_id],
+                )?;
+                // Delete any orphaned mnemonics that conflicted
+                tx.execute(
+                    "DELETE FROM mnemonics WHERE memory_id = ?1",
+                    params![old_id],
+                )?;
+
+                // Transfer links from old to new
+                tx.execute(
+                    "UPDATE OR IGNORE memory_links SET source_id = ?1 WHERE source_id = ?2",
+                    params![memory_id, old_id],
+                )?;
+                tx.execute(
+                    "UPDATE OR IGNORE memory_links SET target_id = ?1 WHERE target_id = ?2",
+                    params![memory_id, old_id],
+                )?;
+                // Clean up any self-links created by transfer
+                tx.execute(
+                    "DELETE FROM memory_links WHERE source_id = target_id",
+                    [],
+                )?;
+
+                // Create supersedes link
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type) VALUES (?1, ?2, 'supersedes')",
+                    params![memory_id, old_id],
+                )?;
+
+                // Delete old memory_vectors
+                tx.execute(
+                    "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                    params![old_id],
+                )?;
+
+                // Delete old memory (CASCADE handles remaining)
+                tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
+
+                Some(old_title.clone())
+            } else {
+                // No merge — just auto-link
+                for (neighbor_mid, dist, _, _) in &deduped {
+                    if *dist < AUTO_LINK_THRESHOLD {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_type)
+                             VALUES (?1, ?2, 'related')",
+                            params![memory_id, neighbor_mid],
+                        )?;
+                    }
+                }
+                None
+            }
         };
 
         tx.commit()?;

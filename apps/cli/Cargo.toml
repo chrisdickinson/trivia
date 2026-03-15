@@ -20,3 +20,7 @@ tower-http = { workspace = true }
 tower-mcp = { workspace = true }
 include_dir = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -6,8 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use trivia_core::{Embedder, MemoryStore, TriviaConfig};
 
-mod mcp;
-mod www;
+use trivia_cli::{acl, mcp, www};
 
 #[derive(Parser)]
 #[command(name = "trivia", about = "Semantic memory store")]
@@ -91,7 +90,11 @@ enum Command {
     /// Start MCP server (stdin/stdout JSON-RPC)
     Mcp,
     /// Start web UI server
-    Www,
+    Www {
+        /// Tag-based ACL for shared MCP access (e.g. 'project:update,*:read')
+        #[arg(long)]
+        share: Option<String>,
+    },
     /// List all unique tags with memory counts
     ListTags {
         /// Output as JSON
@@ -303,11 +306,15 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(mcp::serve(store, embedder, config))?;
         }
-        Command::Www => {
+        Command::Www { share } => {
             let bind_addr = std::env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+            let acl = match share {
+                Some(spec) => acl::Acl::parse(&spec)?,
+                None => acl::Acl::closed(),
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(www::serve(store, embedder, &bind_addr))?;
+            rt.block_on(www::serve(store, embedder, &bind_addr, config, acl))?;
         }
         Command::ListTags { json } => {
             let tags = store.list_tags()?;

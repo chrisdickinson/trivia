@@ -10,14 +10,18 @@ use axum::{
 };
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use trivia_core::{Embedder, MemoryStore};
+use tower_mcp::transport::http::HttpTransport;
+use trivia_core::{Embedder, MemoryStore, TriviaConfig};
+
+use crate::acl::Acl;
 
 static WWW_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/www/dist");
 
 struct AppState {
-    store: tokio::sync::Mutex<MemoryStore>,
-    embedder: tokio::sync::Mutex<Embedder>,
+    store: Arc<Mutex<MemoryStore>>,
+    embedder: Arc<Mutex<Embedder>>,
 }
 
 type AppResult<T> = std::result::Result<T, AppError>;
@@ -36,10 +40,19 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
     }
 }
 
-pub async fn serve(store: MemoryStore, embedder: Embedder, bind_addr: &str) -> Result<()> {
+pub async fn serve(
+    store: MemoryStore,
+    embedder: Embedder,
+    bind_addr: &str,
+    config: TriviaConfig,
+    acl: Acl,
+) -> Result<()> {
+    let store = Arc::new(Mutex::new(store));
+    let embedder = Arc::new(Mutex::new(embedder));
+
     let state = Arc::new(AppState {
-        store: tokio::sync::Mutex::new(store),
-        embedder: tokio::sync::Mutex::new(embedder),
+        store: store.clone(),
+        embedder: embedder.clone(),
     });
 
     let api = Router::new()
@@ -59,10 +72,25 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, bind_addr: &str) -> R
             post(add_mnemonic_handler).delete(remove_mnemonic_handler),
         );
 
+    // Mount MCP over HTTP at /mcp
+    let acl = Arc::new(acl);
+    let mcp_router = crate::mcp::build_mcp_router(store, embedder, config, acl.clone());
+    let mcp = HttpTransport::new(mcp_router)
+        .disable_origin_validation()
+        .into_router_at("/mcp");
+
+    let acl_desc = if acl.is_open() {
+        "open (all tools allowed)"
+    } else {
+        "restricted by --share ACL"
+    };
+    eprintln!("MCP endpoint at /mcp ({acl_desc})");
+
     let app = api
+        .with_state(state)
+        .merge(mcp)
         .fallback(get(static_handler))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .layer(CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     eprintln!("Listening on http://{bind_addr}");
