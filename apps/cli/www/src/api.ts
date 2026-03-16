@@ -60,6 +60,29 @@ async function json<T>(res: Response): Promise<T> {
   return res.json()
 }
 
+export interface AuthUser {
+  username: string
+  acl: string
+}
+
+export interface AuthProviders {
+  providers: string[]
+}
+
+export const auth = {
+  me: () =>
+    fetch('/auth/me').then(r => {
+      if (r.status === 401) return null
+      return json<AuthUser>(r)
+    }).catch(() => null),
+
+  providers: () =>
+    fetch('/auth/providers').then(r => json<AuthProviders>(r)).catch(() => ({ providers: [] })),
+
+  logout: () =>
+    fetch('/auth/logout', { method: 'POST' }),
+}
+
 export const api = {
   listMemories: () =>
     fetch('/api/memories').then(r => json<MemorySummary[]>(r)),

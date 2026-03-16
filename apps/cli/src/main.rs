@@ -124,6 +124,65 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Manage users, providers, and identity links
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Add a user
+    AddUser {
+        /// Username
+        username: String,
+        /// ACL spec (e.g. '*:update', 'project:read,*:none')
+        #[arg(long, default_value = "*:none")]
+        acl: String,
+    },
+    /// Remove a user
+    RemoveUser {
+        /// Username
+        username: String,
+    },
+    /// List all users
+    ListUsers,
+    /// Add an OAuth provider
+    AddProvider {
+        /// Provider name (e.g. 'github')
+        name: String,
+        /// Provider type
+        #[arg(long = "type")]
+        provider_type: String,
+        /// OAuth client ID
+        #[arg(long)]
+        client_id: String,
+        /// OAuth client secret
+        #[arg(long)]
+        client_secret: String,
+    },
+    /// Remove an OAuth provider
+    RemoveProvider {
+        /// Provider name
+        name: String,
+    },
+    /// List all OAuth providers
+    ListProviders,
+    /// Link a user identity to an OAuth provider
+    LinkIdentity {
+        /// Username
+        username: String,
+        /// Provider name
+        #[arg(long)]
+        provider: String,
+        /// Provider username (e.g. GitHub login)
+        #[arg(long)]
+        provider_username: String,
+        /// Provider user ID (stable, numeric). If omitted, uses provider_username.
+        #[arg(long)]
+        provider_user_id: Option<String>,
+    },
 }
 
 fn db_path(config: &TriviaConfig) -> PathBuf {
@@ -447,6 +506,76 @@ fn main() -> Result<()> {
             }
 
             eprintln!("\n{BOLD}{merged_count}{RESET} memories merged.");
+        }
+        Command::Admin { command: admin_cmd } => {
+            match admin_cmd {
+                AdminCommand::AddUser { username, acl: acl_spec } => {
+                    // Validate the ACL spec parses
+                    acl::Acl::parse(&acl_spec)?;
+                    let user = store.create_user(&username, &acl_spec)?;
+                    eprintln!("Created user: {} (acl: {})", user.username, user.acl);
+                }
+                AdminCommand::RemoveUser { username } => {
+                    if store.delete_user(&username)? {
+                        eprintln!("Removed user: {username}");
+                    } else {
+                        eprintln!("User not found: {username}");
+                    }
+                }
+                AdminCommand::ListUsers => {
+                    let users = store.list_users()?;
+                    if users.is_empty() {
+                        println!("No users.");
+                    } else {
+                        for u in &users {
+                            println!("{} (acl: {})", u.username, u.acl);
+                        }
+                    }
+                }
+                AdminCommand::AddProvider {
+                    name,
+                    provider_type,
+                    client_id,
+                    client_secret,
+                } => {
+                    let prov = store.create_provider(&name, &provider_type, &client_id, &client_secret)?;
+                    eprintln!("Created provider: {} (type: {})", prov.name, prov.provider_type);
+                }
+                AdminCommand::RemoveProvider { name } => {
+                    if store.delete_provider(&name)? {
+                        eprintln!("Removed provider: {name}");
+                    } else {
+                        eprintln!("Provider not found: {name}");
+                    }
+                }
+                AdminCommand::ListProviders => {
+                    let providers = store.list_providers()?;
+                    if providers.is_empty() {
+                        println!("No providers.");
+                    } else {
+                        for p in &providers {
+                            let status = if p.enabled { "enabled" } else { "disabled" };
+                            println!("{} (type: {}, {})", p.name, p.provider_type, status);
+                        }
+                    }
+                }
+                AdminCommand::LinkIdentity {
+                    username,
+                    provider,
+                    provider_username,
+                    provider_user_id,
+                } => {
+                    let user = store.get_user_by_username(&username)?
+                        .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
+                    let prov = store.get_provider_by_name(&provider)?
+                        .ok_or_else(|| anyhow::anyhow!("provider not found: {provider}"))?;
+                    let puid = provider_user_id.as_deref().unwrap_or(&provider_username);
+                    store.link_identity(user.id, prov.id, &provider_username, puid)?;
+                    eprintln!(
+                        "Linked {username} to {provider} as {provider_username} (id: {puid})"
+                    );
+                }
+            }
         }
     }
 

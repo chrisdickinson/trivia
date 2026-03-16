@@ -5,9 +5,11 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     http::{StatusCode, header},
+    middleware,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use dashmap::DashMap;
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -16,6 +18,8 @@ use tower_mcp::transport::http::HttpTransport;
 use trivia_core::{Embedder, MemoryStore, TriviaConfig};
 
 use crate::acl::Acl;
+use crate::auth_middleware::{AuthState, SessionAclMap, require_auth};
+use crate::oauth::{self, OAuthState};
 
 static WWW_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/www/dist");
 
@@ -50,6 +54,20 @@ pub async fn serve(
     let store = Arc::new(Mutex::new(store));
     let embedder = Arc::new(Mutex::new(embedder));
 
+    // Determine external URL for OAuth redirects
+    let external_url = config
+        .external_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{bind_addr}"));
+
+    // Check if auth providers are configured
+    let auth_enabled = {
+        let s = store.lock().await;
+        s.has_auth_providers().unwrap_or(false)
+    };
+
+    let session_acls: SessionAclMap = Arc::new(DashMap::new());
+
     let state = Arc::new(AppState {
         store: store.clone(),
         embedder: embedder.clone(),
@@ -74,21 +92,55 @@ pub async fn serve(
 
     // Mount MCP over HTTP at /mcp
     let acl = Arc::new(acl);
-    let mcp_router = crate::mcp::build_mcp_router(store, embedder, config, acl.clone());
+    let mcp_router = crate::mcp::build_mcp_router(
+        store.clone(),
+        embedder,
+        config.clone(),
+        acl.clone(),
+        session_acls.clone(),
+    );
     let mcp = HttpTransport::new(mcp_router)
         .disable_origin_validation()
         .into_router_at("/mcp");
 
-    let acl_desc = if acl.is_open() {
+    // Auth middleware state
+    let auth_state = AuthState {
+        store: store.clone(),
+        session_acls: session_acls.clone(),
+        external_url: external_url.clone(),
+        auth_enabled,
+    };
+
+    // OAuth routes (always public, no auth middleware)
+    let oauth_state = OAuthState {
+        store: store.clone(),
+        external_url: external_url.clone(),
+    };
+    let oauth_routes = oauth::router().with_state(oauth_state);
+
+    // Protected routes: API + MCP get auth middleware when auth is enabled
+    let protected = api
+        .with_state(state)
+        .merge(mcp)
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_auth,
+        ));
+
+    let acl_desc = if auth_enabled {
+        "OAuth (per-user ACL)"
+    } else if acl.is_open() {
         "open (all tools allowed)"
     } else {
         "restricted by --share ACL"
     };
     eprintln!("MCP endpoint at /mcp ({acl_desc})");
+    if auth_enabled {
+        eprintln!("Auth enabled — OAuth providers configured");
+    }
 
-    let app = api
-        .with_state(state)
-        .merge(mcp)
+    let app = protected
+        .merge(oauth_routes)
         .fallback(get(static_handler))
         .layer(CorsLayer::permissive());
 

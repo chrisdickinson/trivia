@@ -355,6 +355,73 @@ impl MemoryStore {
             }
         }
 
+        // --- Auth tables migration ---
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                acl TEXT NOT NULL DEFAULT '*:none',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                provider_type TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                client_secret TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                config TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS user_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider_id INTEGER NOT NULL REFERENCES oauth_providers(id) ON DELETE CASCADE,
+                provider_username TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(provider_id, provider_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_secret_hash TEXT,
+                redirect_uris TEXT NOT NULL DEFAULT '[]',
+                client_name TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_codes (
+                code TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                code_challenge TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                access_token_hash TEXT UNIQUE NOT NULL,
+                refresh_token_hash TEXT UNIQUE,
+                client_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        )?;
+
         Ok(())
     }
 

@@ -10,12 +10,27 @@ use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
 use trivia_core::{Embedder, Memory, MemoryStore, MemorizeResult, TriviaConfig};
 
 use crate::acl::Acl;
+use crate::auth_middleware::{CURRENT_USER, SessionAclMap};
 
 struct AppState {
     store: Arc<Mutex<MemoryStore>>,
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
+    #[allow(dead_code)]
+    session_acls: SessionAclMap,
+}
+
+impl AppState {
+    /// Resolve the effective ACL and username for the current request.
+    /// Checks the task-local CURRENT_USER first (set by auth middleware),
+    /// then falls back to the shared ACL.
+    fn effective_acl(&self) -> (Arc<Acl>, Option<String>) {
+        if let Ok(Some(user)) = CURRENT_USER.try_with(|u| u.clone()) {
+            return (Arc::new(user.acl), Some(user.username));
+        }
+        (self.acl.clone(), None)
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -241,8 +256,9 @@ pub fn build_mcp_router(
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
+    session_acls: SessionAclMap,
 ) -> McpRouter {
-    let state = Arc::new(AppState { store, embedder, config, acl });
+    let state = Arc::new(AppState { store, embedder, config, acl, session_acls });
     build_router(state)
 }
 
@@ -253,6 +269,7 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         embedder: Arc::new(Mutex::new(embedder)),
         config,
         acl: Arc::new(Acl::open()),
+        session_acls: Arc::new(dashmap::DashMap::new()),
     });
 
     let router = build_router(state);
@@ -267,18 +284,27 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: MemorizeInput| {
             let app = app.clone();
             async move {
-                let tags = TriviaConfig::merge_tags(&app.config.memorize.tags, &input.tags);
+                let (acl, username) = app.effective_acl();
+                let mut tags = TriviaConfig::merge_tags(&app.config.memorize.tags, &input.tags);
+
+                // Auto-tag with @username when authenticated
+                if let Some(ref name) = username {
+                    let user_tag = format!("@{name}");
+                    if !tags.contains(&user_tag) {
+                        tags.push(user_tag);
+                    }
+                }
 
                 // ACL: at least one tag must grant update
-                if !app.acl.is_open() && !app.acl.check_update(&tags) {
+                if !acl.is_open() && !acl.check_update(&tags) {
                     return Err(anyhow::anyhow!(
-                        "access denied: none of the tags [{}] grant update access",
-                        tags.join(", ")
+                        "access denied: your permissions are [{}] which do not grant update access",
+                        acl
                     ))
                     .tool_context("memorize denied");
                 }
 
-                let skip_merge = !app.acl.is_open();
+                let skip_merge = !acl.is_open();
                 let embedding = app.embedder.lock().await.embed(&input.mnemonic)
                     .tool_context("embedding failed")?;
                 let result = app.store.lock().await
@@ -295,6 +321,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: RecallInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 let embedding = app.embedder.lock().await.embed(&input.query)
                     .tool_context("embedding failed")?;
                 let limit = input.limit.unwrap_or(5).clamp(1, 10);
@@ -306,8 +333,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     .tool_context("recall failed")?;
 
                 // ACL: post-filter by read access
-                if !app.acl.is_open() {
-                    memories.retain(|m| app.acl.check_read(&m.tags));
+                if !acl.is_open() {
+                    memories.retain(|m| acl.check_read(&m.tags));
                 }
 
                 // Apply min_score: param > config > 0.0
@@ -332,6 +359,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: RateInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 // Merge single + batch mnemonics
                 let mut all = input.mnemonics.unwrap_or_default();
                 if let Some(single) = input.mnemonic {
@@ -345,13 +373,13 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 // ACL: each memory must grant update
-                if !app.acl.is_open() {
+                if !acl.is_open() {
                     for mn in &all {
                         if let Some(tags) = memory_tags(&app.store, mn).await
                             .tool_context("rate failed")? {
-                            if !app.acl.check_update(&tags) {
+                            if !acl.check_update(&tags) {
                                 return Err(anyhow::anyhow!(
-                                    "access denied: memory \"{}\" does not grant update access", mn
+                                    "access denied: your permissions are [{}] which do not grant update access", acl
                                 )).tool_context("rate denied");
                             }
                         }
@@ -383,14 +411,15 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: LinkInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 // ACL: both memories must grant update
-                if !app.acl.is_open() {
+                if !acl.is_open() {
                     for mn in [&input.source, &input.target] {
                         if let Some(tags) = memory_tags(&app.store, mn).await
                             .tool_context("link failed")? {
-                            if !app.acl.check_update(&tags) {
+                            if !acl.check_update(&tags) {
                                 return Err(anyhow::anyhow!(
-                                    "access denied: memory \"{}\" does not grant update access", mn
+                                    "access denied: your permissions are [{}] which do not grant update access", acl
                                 )).tool_context("link denied");
                             }
                         }
@@ -416,14 +445,15 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: MergeInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 // ACL: both memories must grant update
-                if !app.acl.is_open() {
+                if !acl.is_open() {
                     for mn in [&input.keep, &input.discard] {
                         if let Some(tags) = memory_tags(&app.store, mn).await
                             .tool_context("merge failed")? {
-                            if !app.acl.check_update(&tags) {
+                            if !acl.check_update(&tags) {
                                 return Err(anyhow::anyhow!(
-                                    "access denied: memory \"{}\" does not grant update access", mn
+                                    "access denied: your permissions are [{}] which do not grant update access", acl
                                 )).tool_context("merge denied");
                             }
                         }
@@ -455,17 +485,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: ExportInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 let dir = std::path::Path::new(&input.directory);
                 let tags = input.tags.as_deref();
 
-                if app.acl.is_open() {
+                if acl.is_open() {
                     app.store.lock().await
                         .export(dir, tags)
                         .tool_context("export failed")?;
                 } else {
                     // ACL: only export readable memories
+                    let acl = acl.clone();
                     app.store.lock().await
-                        .export_filtered(dir, tags, |mem_tags| app.acl.check_read(mem_tags))
+                        .export_filtered(dir, tags, move |mem_tags| acl.check_read(mem_tags))
                         .tool_context("export failed")?;
                 }
 
@@ -475,13 +507,12 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .build();
 
     let app = state.clone();
-    let acl_for_import = app.acl.clone();
     let import = ToolBuilder::new("import")
         .description("Import memories from a directory of markdown files with YAML frontmatter.")
         .handler(move |input: ImportInput| {
             let app = app.clone();
-            let acl = acl_for_import.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 // ACL: import is blocked in shared mode
                 if !acl.is_open() {
                     return Err(anyhow::anyhow!("import is disabled in shared mode"))
@@ -510,6 +541,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .no_params_handler(move || {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 let tags = app
                     .store
                     .lock()
@@ -518,11 +550,11 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     .tool_context("list-tags failed")?;
 
                 // ACL: post-filter by read access
-                let tags: Vec<_> = if app.acl.is_open() {
+                let tags: Vec<_> = if acl.is_open() {
                     tags
                 } else {
                     tags.into_iter()
-                        .filter(|t| app.acl.tag_level(&t.tag) >= crate::acl::AccessLevel::Read)
+                        .filter(|t| acl.tag_level(&t.tag) >= crate::acl::AccessLevel::Read)
                         .collect()
                 };
 
@@ -545,6 +577,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: EditInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 if input.new_mnemonic.is_none() && input.add_tags.is_empty() && input.remove_tags.is_empty()
                     && input.add_mnemonics.is_empty() && input.remove_mnemonics.is_empty() {
                     return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags, add_mnemonics, remove_mnemonics"))
@@ -552,13 +585,13 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 // ACL: memory's current tags must grant update
-                if !app.acl.is_open() {
+                if !acl.is_open() {
                     if let Some(tags) = memory_tags(&app.store, &input.mnemonic).await
                         .tool_context("edit failed")? {
-                        if !app.acl.check_update(&tags) {
+                        if !acl.check_update(&tags) {
                             return Err(anyhow::anyhow!(
-                                "access denied: memory \"{}\" does not grant update access",
-                                input.mnemonic
+                                "access denied: your permissions are [{}] which do not grant update access",
+                                acl
                             )).tool_context("edit denied");
                         }
                     }
@@ -615,18 +648,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
         .handler(move |input: RenameTagInput| {
             let app = app.clone();
             async move {
+                let (acl, _username) = app.effective_acl();
                 // ACL: both old and new tag must grant update
-                if !app.acl.is_open() {
-                    if app.acl.tag_level(&input.old_tag) < crate::acl::AccessLevel::Update {
+                if !acl.is_open() {
+                    if acl.tag_level(&input.old_tag) < crate::acl::AccessLevel::Update {
                         return Err(anyhow::anyhow!(
-                            "access denied: tag \"{}\" does not grant update access",
-                            input.old_tag
+                            "access denied: your permissions are [{}] which do not grant update access",
+                            acl
                         )).tool_context("rename-tag denied");
                     }
-                    if app.acl.tag_level(&input.new_tag) < crate::acl::AccessLevel::Update {
+                    if acl.tag_level(&input.new_tag) < crate::acl::AccessLevel::Update {
                         return Err(anyhow::anyhow!(
-                            "access denied: tag \"{}\" does not grant update access",
-                            input.new_tag
+                            "access denied: your permissions are [{}] which do not grant update access",
+                            acl
                         )).tool_context("rename-tag denied");
                     }
                 }

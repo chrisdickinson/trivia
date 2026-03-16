@@ -43,6 +43,17 @@ pub struct Acl {
     rules: Vec<AclRule>,
 }
 
+impl fmt::Display for Acl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parts: Vec<String> = self
+            .rules
+            .iter()
+            .map(|r| format!("{}:{}", r.pattern, r.level))
+            .collect();
+        write!(f, "{}", parts.join(","))
+    }
+}
+
 impl Acl {
     /// Everything allowed — for stdio MCP (local, trusted).
     pub fn open() -> Self {

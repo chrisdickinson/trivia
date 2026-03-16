@@ -11,6 +11,8 @@ pub struct TriviaConfig {
     #[serde(default)]
     pub export: ExportConfig,
     pub database: Option<String>,
+    /// External URL for OAuth redirect URIs (e.g. "https://trivia.example.com")
+    pub external_url: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
