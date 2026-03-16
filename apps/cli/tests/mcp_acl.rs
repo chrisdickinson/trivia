@@ -24,7 +24,6 @@ fn test_app(acl: Acl) -> (axum::Router, Arc<Mutex<MemoryStore>>) {
         EMBEDDER.clone(),
         TriviaConfig::default(),
         Arc::new(acl),
-        Arc::new(dashmap::DashMap::new()),
     );
     let router = HttpTransport::new(mcp)
         .disable_origin_validation()

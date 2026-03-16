@@ -9,7 +9,6 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use dashmap::DashMap;
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -18,7 +17,7 @@ use tower_mcp::transport::http::HttpTransport;
 use trivia_core::{Embedder, MemoryStore, TriviaConfig};
 
 use crate::acl::Acl;
-use crate::auth_middleware::{AuthState, SessionAclMap, require_auth};
+use crate::auth_middleware::{AuthState, require_auth};
 use crate::oauth::{self, OAuthState};
 
 static WWW_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/www/dist");
@@ -66,8 +65,6 @@ pub async fn serve(
         s.has_auth_providers().unwrap_or(false)
     };
 
-    let session_acls: SessionAclMap = Arc::new(DashMap::new());
-
     let state = Arc::new(AppState {
         store: store.clone(),
         embedder: embedder.clone(),
@@ -97,7 +94,6 @@ pub async fn serve(
         embedder,
         config.clone(),
         acl.clone(),
-        session_acls.clone(),
     );
     let mcp = HttpTransport::new(mcp_router)
         .disable_origin_validation()
@@ -106,8 +102,8 @@ pub async fn serve(
     // Auth middleware state
     let auth_state = AuthState {
         store: store.clone(),
-        session_acls: session_acls.clone(),
         external_url: external_url.clone(),
+        fallback_acl: acl.to_string(),
         auth_enabled,
     };
 

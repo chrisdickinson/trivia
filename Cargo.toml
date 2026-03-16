@@ -11,7 +11,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
 zerocopy = "0.7"
 fastembed = "4"
-tower-mcp = { version = "0.6", features = ["full"] }
+tower-mcp = { version = "0.8", features = ["full"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
@@ -24,5 +24,4 @@ tower-http = { version = "0.6", features = ["cors"] }
 include_dir = "0.7"
 sha2 = "0.10"
 rand = "0.8"
-dashmap = "6"
 reqwest = { version = "0.12", features = ["json"] }

@@ -5,32 +5,20 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tower_mcp::error::ResultExt;
+use tower_mcp::extract::{Extension, Json, State};
+use tower_mcp::oauth::token::TokenClaims;
 use tower_mcp::transport::stdio::StdioTransport;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
 use trivia_core::{Embedder, Memory, MemoryStore, MemorizeResult, TriviaConfig};
 
 use crate::acl::Acl;
-use crate::auth_middleware::{CURRENT_USER, SessionAclMap};
+use crate::auth_middleware::acl_from_claims;
 
 struct AppState {
     store: Arc<Mutex<MemoryStore>>,
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
-    #[allow(dead_code)]
-    session_acls: SessionAclMap,
-}
-
-impl AppState {
-    /// Resolve the effective ACL and username for the current request.
-    /// Checks the task-local CURRENT_USER first (set by auth middleware),
-    /// then falls back to the shared ACL.
-    fn effective_acl(&self) -> (Arc<Acl>, Option<String>) {
-        if let Ok(Some(user)) = CURRENT_USER.try_with(|u| u.clone()) {
-            return (Arc::new(user.acl), Some(user.username));
-        }
-        (self.acl.clone(), None)
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -256,9 +244,8 @@ pub fn build_mcp_router(
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
-    session_acls: SessionAclMap,
 ) -> McpRouter {
-    let state = Arc::new(AppState { store, embedder, config, acl, session_acls });
+    let state = Arc::new(AppState { store, embedder, config, acl });
     build_router(state)
 }
 
@@ -269,7 +256,6 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
         embedder: Arc::new(Mutex::new(embedder)),
         config,
         acl: Arc::new(Acl::open()),
-        session_acls: Arc::new(dashmap::DashMap::new()),
     });
 
     let router = build_router(state);
@@ -278,13 +264,15 @@ pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig)
 }
 
 fn build_router(state: Arc<AppState>) -> McpRouter {
-    let app = state.clone();
+    let s = state.clone();
     let memorize = ToolBuilder::new("memorize")
         .description("Store a fact or context for later recall. Use a mnemonic (file path, concept, phrase) plus the content to remember. Good examples include \"project design\"; \"feedback on src/files/foo.rs\"; \"implementation of the Frobnicator Component\". You're looking to capture what the memory was about with the mnemonic rather than the content of the memory. Mnemonics that are very similar to existing ones may be auto-merged. The response will note nearby memories and warn about close collisions.")
-        .handler(move |input: MemorizeInput| {
-            let app = app.clone();
-            async move {
-                let (acl, username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<MemorizeInput>| async move {
+                let (acl, username) = acl_from_claims(&claims, &app.acl);
                 let mut tags = TriviaConfig::merge_tags(&app.config.memorize.tags, &input.tags);
 
                 // Auto-tag with @username when authenticated
@@ -311,17 +299,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     .memorize_with_options(&input.mnemonic, &input.content, &tags, &embedding, skip_merge)
                     .tool_context("memorize failed")?;
                 Ok(CallToolResult::text(format_memorize_response(&input.mnemonic, &result)))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let recall = ToolBuilder::new("recall")
         .description("Retrieve previously memorized facts by semantic similarity. Provide a natural language query describing what you're looking for. Use `full_text_search` alongside it to boost results that contain a specific keyword or phrase — this is useful when you know the exact term but want semantic ranking too. Use min_score to filter low-relevance results. Use exclude_tags to hide irrelevant categories.")
-        .handler(move |input: RecallInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<RecallInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 let embedding = app.embedder.lock().await.embed(&input.query)
                     .tool_context("embedding failed")?;
                 let limit = input.limit.unwrap_or(5).clamp(1, 10);
@@ -349,17 +339,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
 
                 let truncate = input.truncate.or(app.config.recall.body_max_chars);
                 Ok(CallToolResult::text(format_memories(&memories, truncate)))
-            }
-       })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let rate = ToolBuilder::new("rate")
         .description("Rate previously recalled memories as useful or not useful. Call this after using recalled memories to improve future ranking. Accepts a single mnemonic or a batch of mnemonics. Silent on complete success; reports only not-found mnemonics.")
-        .handler(move |input: RateInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<RateInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 // Merge single + batch mnemonics
                 let mut all = input.mnemonics.unwrap_or_default();
                 if let Some(single) = input.mnemonic {
@@ -401,17 +393,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                         .join("\n");
                     Ok(CallToolResult::text(msg))
                 }
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let link = ToolBuilder::new("link")
         .description("Create a link between two memories. Link types: \"related\" (topically connected), \"supersedes\" (source replaces target — used after corrections or updates), \"derived_from\" (source was created based on target).")
-        .handler(move |input: LinkInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<LinkInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 // ACL: both memories must grant update
                 if !acl.is_open() {
                     for mn in [&input.source, &input.target] {
@@ -435,17 +429,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     "Linked: {} --[{}]--> {}",
                     input.source, input.link_type, input.target
                 )))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let merge = ToolBuilder::new("merge")
         .description("Merge two memories: keep absorbs discard's content, tags, and links. The discard memory is deleted. Use when two memories cover the same topic and should be one entry. Prefer `link` over merge when memories are related but distinct.")
-        .handler(move |input: MergeInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<MergeInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 // ACL: both memories must grant update
                 if !acl.is_open() {
                     for mn in [&input.keep, &input.discard] {
@@ -475,17 +471,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     "Merged: {} absorbed {}",
                     input.keep, input.discard
                 )))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let export = ToolBuilder::new("export")
         .description("Export memories to a directory as markdown files with YAML frontmatter. Optionally filter by tags.")
-        .handler(move |input: ExportInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<ExportInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 let dir = std::path::Path::new(&input.directory);
                 let tags = input.tags.as_deref();
 
@@ -502,17 +500,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 Ok(CallToolResult::text(format!("Exported to: {}", input.directory)))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let import = ToolBuilder::new("import")
         .description("Import memories from a directory of markdown files with YAML frontmatter.")
-        .handler(move |input: ImportInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<ImportInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 // ACL: import is blocked in shared mode
                 if !acl.is_open() {
                     return Err(anyhow::anyhow!("import is disabled in shared mode"))
@@ -531,17 +531,18 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     "Imported: {} created, {} updated, {} unchanged",
                     result.created, result.updated, result.unchanged
                 )))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let list_tags = ToolBuilder::new("list-tags")
         .description("List all unique tags with the number of memories using each tag.")
-        .no_params_handler(move || {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 let tags = app
                     .store
                     .lock()
@@ -567,17 +568,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     output.push_str(&format!("{} ({} memories)\n", t.tag, t.count));
                 }
                 Ok(CallToolResult::text(output))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let edit = ToolBuilder::new("edit")
         .description("Edit an existing memory's mnemonic or tags. Use to disambiguate colliding mnemonics or fix tag assignments. If the mnemonic is changed, the memory will be re-embedded. Use add_mnemonics/remove_mnemonics to manage additional aliases — each alias gets its own embedding vector for improved recall coverage.")
-        .handler(move |input: EditInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<EditInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 if input.new_mnemonic.is_none() && input.add_tags.is_empty() && input.remove_tags.is_empty()
                     && input.add_mnemonics.is_empty() && input.remove_mnemonics.is_empty() {
                     return Err(anyhow::anyhow!("provide at least one of: new_mnemonic, add_tags, remove_tags, add_mnemonics, remove_mnemonics"))
@@ -638,17 +641,19 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     output.push_str(&format!("\nMnemonics: [{}]", result.mnemonics.join(", ")));
                 }
                 Ok(CallToolResult::text(output))
-            }
-        })
+            },
+        )
         .build();
 
-    let app = state.clone();
+    let s = state.clone();
     let rename_tag = ToolBuilder::new("rename-tag")
         .description("Rename a tag across all memories. No re-embedding needed.")
-        .handler(move |input: RenameTagInput| {
-            let app = app.clone();
-            async move {
-                let (acl, _username) = app.effective_acl();
+        .extractor_handler(
+            s,
+            |State(app): State<Arc<AppState>>,
+             Extension(claims): Extension<TokenClaims>,
+             Json(input): Json<RenameTagInput>| async move {
+                let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 // ACL: both old and new tag must grant update
                 if !acl.is_open() {
                     if acl.tag_level(&input.old_tag) < crate::acl::AccessLevel::Update {
@@ -672,13 +677,18 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     "Renamed tag \"{}\" -> \"{}\" across {count} memories",
                     input.old_tag, input.new_tag
                 )))
-            }
-        })
+            },
+        )
         .build();
+
+    // Default TokenClaims for stdio/test (no HTTP middleware).
+    // For HTTP, the auth middleware inserts per-request claims which override this.
+    let default_claims = crate::auth_middleware::default_claims(&state.acl);
 
     McpRouter::new()
         .server_info("trivia", "0.1.0")
         .instructions("Semantic memory store. Memories are keyed by a short mnemonic (a concept name, file path, or phrase) and hold longer-form content. The mnemonic is what gets embedded for vector search; content is searched via full-text keyword match.\n\nTypical workflow: `recall` before starting work to load relevant context, `memorize` to save new facts, `rate` results after using them so ranking improves over time. Very similar mnemonics are auto-merged on memorize (distance < 0.15) and auto-linked (distance < 0.30).\n\nUse `edit` to rename mnemonics that collide in recall. Use `merge` when two memories cover the same topic. Use `link` to create explicit relationships between distinct memories.\n\nMemories can have multiple mnemonic aliases via `edit`'s `add_mnemonics`/`remove_mnemonics` parameters. Each alias gets its own embedding vector, increasing recall surface area when different phrasings are used.")
+        .with_state(default_claims)
         .tool(memorize)
         .tool(recall)
         .tool(rate)
