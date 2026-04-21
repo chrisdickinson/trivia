@@ -6,7 +6,8 @@
       "mcp__plugin_trivia_trivia__memorize",
       "mcp__trivia__memorize",
       "mcp__trivia__recall",
-      "mcp__plugin_trivia_trivia__recall"
+      "mcp__plugin_trivia_trivia__recall",
+      "Bash(cargo check:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

@@ -9,7 +9,29 @@ permissions:
   contents: write
 
 jobs:
+  build-www:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build web UI
+        working-directory: apps/cli/www
+        run: npm ci && npm run build
+
+      - name: Package web UI
+        run: cd apps/cli/www/dist && tar czf ../../../../trivia-www.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivia-www.tar.gz
+          path: trivia-www.tar.gz
+
   build:
+    needs: build-www
     strategy:
       matrix:
         include:
@@ -22,31 +44,42 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: trivia-aarch64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: trivia-x86_64-pc-windows-msvc.zip
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build web UI
-        working-directory: apps/cli/www
-        run: npm ci && npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: trivia-www.tar.gz
+
+      - name: Extract web UI
+        run: mkdir -p apps/cli/www/dist && tar xzf trivia-www.tar.gz -C apps/cli/www/dist
 
       - name: Build release binary
         run: cargo build --release -p trivia-cli
 
-      - name: Package
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/release/trivia dist/
           cd dist
           tar czf ../${{ matrix.artifact }} trivia
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/release/trivia.exe dist/
+          Compress-Archive -Path dist/trivia.exe -DestinationPath ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:

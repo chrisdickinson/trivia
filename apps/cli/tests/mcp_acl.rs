@@ -192,7 +192,7 @@ async fn read_only_share_filters_recall() {
     let resp = call_tool(&app, &sid, "recall", json!({"query": "fact"})).await;
     assert!(!is_error(&resp), "recall failed: {resp}");
     let text = result_text(&resp);
-    assert!(text.contains("test fact"), "should see test-tagged memory, got: {text}");
+    assert!(text.contains("test fact"), "should see test-tagged memory");
     assert!(
         !text.contains("private fact"),
         "should NOT see private-tagged memory"
