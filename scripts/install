@@ -25,6 +25,10 @@ esac
 case "$OS" in
   linux)  TARGET="${ARCH}-unknown-linux-gnu" ;;
   darwin) TARGET="${ARCH}-apple-darwin" ;;
+  msys*|mingw*|cygwin*)
+    echo "On Windows, run: powershell -ExecutionPolicy Bypass -File scripts/install.ps1" >&2
+    exit 1
+    ;;
   *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
