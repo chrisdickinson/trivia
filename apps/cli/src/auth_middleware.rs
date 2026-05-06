@@ -71,13 +71,9 @@ pub async fn require_auth(
     }
 
     let headers = request.headers().clone();
-    let oauth_state = oauth::OAuthState {
-        store: auth_state.store.clone(),
-        external_url: auth_state.external_url.clone(),
-    };
 
     // Try Bearer token
-    if let Ok(Some(user)) = oauth::extract_bearer_user(&oauth_state, &headers).await {
+    if let Ok(Some(user)) = oauth::extract_bearer_user(&auth_state.store, &headers).await {
         request
             .extensions_mut()
             .insert(make_claims(Some(user.username), &user.acl));

@@ -22,6 +22,21 @@ use crate::oauth::{self, OAuthState};
 
 static WWW_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/www/dist");
 
+/// Normalize a base path: empty stays empty, otherwise ensure leading `/` and
+/// strip trailing `/`. So `""`, `"/"`, `"trivia"`, and `"/trivia/"` all produce
+/// either `""` or `"/trivia"`.
+pub fn normalize_base_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 struct AppState {
     store: Arc<Mutex<MemoryStore>>,
     embedder: Arc<Mutex<Embedder>>,
@@ -47,11 +62,13 @@ pub async fn serve(
     store: MemoryStore,
     embedder: Embedder,
     bind_addr: &str,
+    base_path: &str,
     config: TriviaConfig,
     acl: Acl,
 ) -> Result<()> {
     let store = Arc::new(Mutex::new(store));
     let embedder = Arc::new(Mutex::new(embedder));
+    let base_path = base_path.to_string();
 
     // Determine external URL for OAuth redirects
     let external_url = config
@@ -111,6 +128,7 @@ pub async fn serve(
     let oauth_state = OAuthState {
         store: store.clone(),
         external_url: external_url.clone(),
+        base_path: base_path.clone(),
     };
     let oauth_routes = oauth::router().with_state(oauth_state);
 
@@ -130,18 +148,37 @@ pub async fn serve(
     } else {
         "restricted by --share ACL"
     };
-    eprintln!("MCP endpoint at /mcp ({acl_desc})");
+    eprintln!("MCP endpoint at {base_path}/mcp ({acl_desc})");
     if auth_enabled {
         eprintln!("Auth enabled — OAuth providers configured");
     }
 
-    let app = protected
+    let static_base = base_path.clone();
+    let make_static_svc = || {
+        let bp = static_base.clone();
+        get(move |uri: axum::http::Uri| {
+            let bp = bp.clone();
+            async move { static_handler(uri, bp).await }
+        })
+    };
+    let inner = protected
         .merge(oauth_routes)
-        .fallback(get(static_handler))
-        .layer(CorsLayer::permissive());
+        .fallback(make_static_svc());
+
+    let app = if base_path.is_empty() {
+        inner
+    } else {
+        // `Router::nest("/trivia", inner)` matches `/trivia` and
+        // `/trivia/<rest>`, but not the bare `/trivia/` (axum's nested
+        // catch-all requires a non-empty `rest`). Catch that case explicitly.
+        Router::new()
+            .route(&format!("{base_path}/"), make_static_svc())
+            .nest(&base_path, inner)
+    }
+    .layer(CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    eprintln!("Listening on http://{bind_addr}");
+    eprintln!("Listening on http://{bind_addr}{base_path}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -434,12 +471,15 @@ fn mime_from_ext(ext: &str) -> &'static str {
     }
 }
 
-async fn static_handler(uri: axum::http::Uri) -> Response {
+async fn static_handler(uri: axum::http::Uri, base_path: String) -> Response {
     let path = uri.path().trim_start_matches('/');
 
-    // Try exact file first
+    // Try exact file first (non-HTML assets are served as-is)
     if let Some(file) = WWW_DIR.get_file(path) {
         let ext = path.rsplit('.').next().unwrap_or("");
+        if ext == "html" {
+            return html_response(file.contents(), &base_path);
+        }
         return (
             [(header::CONTENT_TYPE, mime_from_ext(ext))],
             file.contents(),
@@ -449,7 +489,39 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
 
     // SPA fallback: serve index.html
     match WWW_DIR.get_file("index.html") {
-        Some(file) => Html(std::str::from_utf8(file.contents()).unwrap_or("")).into_response(),
+        Some(file) => html_response(file.contents(), &base_path),
         None => (StatusCode::NOT_FOUND, "frontend not built — run: cd apps/cli/www && npm run build").into_response(),
+    }
+}
+
+/// Rewrite an HTML payload so absolute `/assets/...` URLs and the embedded
+/// `__TRIVIA_BASE__` global match the configured base path.
+fn html_response(bytes: &[u8], base_path: &str) -> Response {
+    let raw = std::str::from_utf8(bytes).unwrap_or("");
+    let body = if base_path.is_empty() {
+        // Still inject the global so the SPA can read a consistent value.
+        inject_base_script(raw, "")
+    } else {
+        let rewritten = raw
+            .replace("=\"/assets/", &format!("=\"{base_path}/assets/"))
+            .replace("='/assets/", &format!("='{base_path}/assets/"));
+        inject_base_script(&rewritten, base_path)
+    };
+    Html(body).into_response()
+}
+
+fn inject_base_script(html: &str, base_path: &str) -> String {
+    let snippet = format!(
+        "<script>window.__TRIVIA_BASE__={};</script>",
+        serde_json::to_string(base_path).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    if let Some(idx) = html.find("</head>") {
+        let mut out = String::with_capacity(html.len() + snippet.len());
+        out.push_str(&html[..idx]);
+        out.push_str(&snippet);
+        out.push_str(&html[idx..]);
+        out
+    } else {
+        format!("{snippet}{html}")
     }
 }

@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { MemoryList } from './pages/MemoryList'
 import { MemoryDetail } from './pages/MemoryDetail'
 import { GraphView } from './pages/GraphView'
-import { auth } from './api'
+import { auth, url } from './api'
 
 function LoginPage() {
   const { data: providers } = useQuery({
@@ -30,7 +30,7 @@ function LoginPage() {
           {providers.providers.map(name => (
             <a
               key={name}
-              href={`/auth/login/${name}`}
+              href={url(`/auth/login/${name}`)}
               className="block w-full text-center px-4 py-2 border rounded-md hover:bg-gray-50 font-medium capitalize"
             >
               Sign in with {name}

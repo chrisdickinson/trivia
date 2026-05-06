@@ -21,6 +21,9 @@ pub type SharedStore = Arc<Mutex<MemoryStore>>;
 pub struct OAuthState {
     pub store: SharedStore,
     pub external_url: String,
+    /// Path prefix the server is mounted at (e.g. "/trivia" or ""). Used to
+    /// build callback URIs, post-login redirects, and cookie paths.
+    pub base_path: String,
 }
 
 pub fn router() -> Router<OAuthState> {
@@ -59,11 +62,12 @@ struct ServerMetadata {
 
 async fn server_metadata(State(state): State<OAuthState>) -> impl IntoResponse {
     let base = &state.external_url;
+    let bp = &state.base_path;
     axum::Json(ServerMetadata {
-        issuer: base.clone(),
-        authorization_endpoint: format!("{base}/oauth/authorize"),
-        token_endpoint: format!("{base}/oauth/token"),
-        registration_endpoint: format!("{base}/oauth/register"),
+        issuer: format!("{base}{bp}"),
+        authorization_endpoint: format!("{base}{bp}/oauth/authorize"),
+        token_endpoint: format!("{base}{bp}/oauth/token"),
+        registration_endpoint: format!("{base}{bp}/oauth/register"),
         response_types_supported: vec!["code".into()],
         grant_types_supported: vec!["authorization_code".into(), "refresh_token".into()],
         code_challenge_methods_supported: vec!["S256".into()],
@@ -180,8 +184,8 @@ async fn authorize(
     );
 
     let callback_uri = format!(
-        "{}/oauth/callback/{}",
-        state.external_url, db_provider.name
+        "{}{}/oauth/callback/{}",
+        state.external_url, state.base_path, db_provider.name
     );
     let auth_url = provider.authorize_url(&oauth_state, &callback_uri);
 
@@ -218,8 +222,8 @@ async fn oauth_callback(
     let provider = Provider::from_db(&db_provider)?;
 
     let callback_uri = format!(
-        "{}/oauth/callback/{}",
-        state.external_url, provider_name
+        "{}{}/oauth/callback/{}",
+        state.external_url, state.base_path, provider_name
     );
     drop(store);
 
@@ -366,7 +370,10 @@ async fn auth_login(
     let csrf_state = trivia_core::auth_store::sha256_hex(
         &format!("webui-{}", rand::random::<u64>()),
     );
-    let callback_uri = format!("{}/auth/callback/{}", state.external_url, provider_name);
+    let callback_uri = format!(
+        "{}{}/auth/callback/{}",
+        state.external_url, state.base_path, provider_name,
+    );
     let auth_url = provider.authorize_url(&csrf_state, &callback_uri);
 
     Ok(Redirect::temporary(&auth_url).into_response())
@@ -383,7 +390,10 @@ async fn auth_callback(
         .ok_or_else(|| AppError::bad_request("unknown provider"))?;
     let provider = Provider::from_db(&db_provider)?;
 
-    let callback_uri = format!("{}/auth/callback/{}", state.external_url, provider_name);
+    let callback_uri = format!(
+        "{}{}/auth/callback/{}",
+        state.external_url, state.base_path, provider_name,
+    );
     drop(store);
 
     let provider_token = provider.exchange_code(&params.code, &callback_uri).await?;
@@ -405,15 +415,21 @@ async fn auth_callback(
 
     let session = store.create_session(user.id)?;
 
-    // Set cookie and redirect to /
+    // Set cookie scoped to base_path (or "/" if no base_path) and redirect home.
+    let cookie_path = cookie_path(&state.base_path);
     let cookie = format!(
-        "trivia_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000",
-        session.session_id
+        "trivia_session={}; HttpOnly; SameSite=Lax; Path={}; Max-Age=2592000",
+        session.session_id, cookie_path,
     );
+    let home = if state.base_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", state.base_path)
+    };
 
     Ok((
         [(axum::http::header::SET_COOKIE, cookie)],
-        Redirect::temporary("/"),
+        Redirect::temporary(&home),
     )
         .into_response())
 }
@@ -424,12 +440,19 @@ async fn auth_logout(State(state): State<OAuthState>, headers: axum::http::Heade
         let _ = store.delete_session(&session_id);
     }
 
-    let clear = "trivia_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+    let clear = format!(
+        "trivia_session=; HttpOnly; SameSite=Lax; Path={}; Max-Age=0",
+        cookie_path(&state.base_path),
+    );
     (
         [(axum::http::header::SET_COOKIE, clear)],
         axum::Json(serde_json::json!({"ok": true})),
     )
         .into_response()
+}
+
+fn cookie_path(base_path: &str) -> &str {
+    if base_path.is_empty() { "/" } else { base_path }
 }
 
 #[derive(Serialize)]
@@ -443,7 +466,7 @@ async fn auth_me(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
     // Try bearer token first
-    if let Some(user) = extract_bearer_user(&state, &headers).await? {
+    if let Some(user) = extract_bearer_user(&state.store, &headers).await? {
         return Ok(axum::Json(MeResponse {
             username: user.username,
             acl: user.acl,
@@ -491,7 +514,7 @@ pub fn extract_session_cookie(headers: &axum::http::HeaderMap) -> Option<String>
 }
 
 pub async fn extract_bearer_user(
-    state: &OAuthState,
+    store: &SharedStore,
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<trivia_core::User>> {
     let auth_header = match headers.get("authorization") {
@@ -502,7 +525,7 @@ pub async fn extract_bearer_user(
         Some(t) => t,
         None => return Ok(None),
     };
-    let store = state.store.lock().await;
+    let store = store.lock().await;
     Ok(store.get_user_by_access_token(token)?)
 }
 

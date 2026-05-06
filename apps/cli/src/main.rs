@@ -368,12 +368,15 @@ fn main() -> Result<()> {
         Command::Www { share } => {
             let bind_addr = std::env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+            let base_path = www::normalize_base_path(
+                &std::env::var("TRIVIA_BASE_PATH").unwrap_or_default(),
+            );
             let acl = match share {
                 Some(spec) => acl::Acl::parse(&spec)?,
                 None => acl::Acl::closed(),
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(www::serve(store, embedder, &bind_addr, config, acl))?;
+            rt.block_on(www::serve(store, embedder, &bind_addr, &base_path, config, acl))?;
         }
         Command::ListTags { json } => {
             let tags = store.list_tags()?;
