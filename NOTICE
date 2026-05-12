@@ -1,0 +1,28 @@
+trivia
+======
+
+This product bundles third-party material listed below. The licenses of
+each are reproduced or linked.
+
+------------------------------------------------------------------------
+all-MiniLM-L6-v2 (ONNX port)
+------------------------------------------------------------------------
+
+The trivia binary embeds the ONNX weights and tokenizer files for the
+sentence-transformers/all-MiniLM-L6-v2 model, in the form distributed by
+the Qdrant/all-MiniLM-L6-v2-onnx repository on the Hugging Face Hub:
+
+  https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx
+
+Both the original model and the ONNX port are distributed under the
+Apache License, Version 2.0:
+
+  https://www.apache.org/licenses/LICENSE-2.0
+
+The files are bundled verbatim with no modifications. Files included:
+
+  - model.onnx
+  - tokenizer.json
+  - config.json
+  - special_tokens_map.json
+  - tokenizer_config.json

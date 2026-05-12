@@ -1,26 +1,32 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
+
+const ONNX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/model.onnx"));
+const TOKENIZER_JSON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
+const CONFIG_JSON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/config.json"));
+const SPECIAL_TOKENS_MAP_JSON: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/special_tokens_map.json"));
+const TOKENIZER_CONFIG_JSON: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer_config.json"));
 
 pub struct Embedder {
     model: TextEmbedding,
 }
 
-fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("trivia")
-        .join("fastembed")
-}
-
 impl Embedder {
     pub fn new() -> Result<Self> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                .with_cache_dir(cache_dir())
-                .with_show_download_progress(true),
-        )?;
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: TOKENIZER_JSON.to_vec(),
+            config_file: CONFIG_JSON.to_vec(),
+            special_tokens_map_file: SPECIAL_TOKENS_MAP_JSON.to_vec(),
+            tokenizer_config_file: TOKENIZER_CONFIG_JSON.to_vec(),
+        };
+        let user_model = UserDefinedEmbeddingModel::new(ONNX_BYTES.to_vec(), tokenizer_files)
+            .with_pooling(Pooling::Mean);
+        let model =
+            TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::new())?;
         Ok(Self { model })
     }
 
