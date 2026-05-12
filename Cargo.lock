@@ -3646,7 +3646,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "dirs",
  "fastembed",
  "rand 0.8.5",
  "rusqlite",
