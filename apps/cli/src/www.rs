@@ -203,7 +203,7 @@ async fn create_memory(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<CreateMemoryReq>,
 ) -> AppResult<impl IntoResponse> {
-    let embedder = state.embedder.lock().await;
+    let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.mnemonic)?;
     drop(embedder);
     let store = state.store.lock().await;
@@ -239,7 +239,7 @@ async fn update_memory(
     let new_mnemonic = body.mnemonic.as_deref().unwrap_or(&old_mnemonic);
     let renaming = new_mnemonic != old_mnemonic;
 
-    let embedder = state.embedder.lock().await;
+    let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(new_mnemonic)?;
     drop(embedder);
 
@@ -357,7 +357,7 @@ async fn search_memories(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
 ) -> AppResult<impl IntoResponse> {
-    let embedder = state.embedder.lock().await;
+    let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&params.q)?;
     drop(embedder);
     let tag_list: Option<Vec<String>> = params
@@ -385,7 +385,7 @@ async fn merge_memories(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<MergeReq>,
 ) -> AppResult<impl IntoResponse> {
-    let embedder = state.embedder.lock().await;
+    let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.keep)?;
     drop(embedder);
     let store = state.store.lock().await;
@@ -433,7 +433,7 @@ async fn add_mnemonic_handler(
     Path(title): Path<String>,
     axum::Json(body): axum::Json<MnemonicReq>,
 ) -> AppResult<impl IntoResponse> {
-    let embedder = state.embedder.lock().await;
+    let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.text)?;
     drop(embedder);
     let store = state.store.lock().await;

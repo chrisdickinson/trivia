@@ -24,9 +24,12 @@ impl Embedder {
         Ok(Self { model })
     }
 
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.model.embed(vec![text], None)?;
-        Ok(embeddings.into_iter().next().expect("single input should produce single output"))
+        Ok(embeddings
+            .into_iter()
+            .next()
+            .expect("single input should produce single output"))
     }
 }
 
@@ -36,7 +39,7 @@ mod tests {
 
     #[test]
     fn test_embed_produces_384_dims() -> Result<()> {
-        let embedder = Embedder::new()?;
+        let mut embedder = Embedder::new()?;
         let emb = embedder.embed("hello world")?;
         assert_eq!(emb.len(), 384);
         Ok(())

@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     if !config.recall.tags.is_empty() {
         store.set_boost_tags(config.recall.tags.clone());
     }
-    let embedder = Embedder::new()?;
+    let mut embedder = Embedder::new()?;
 
     match cli.command {
         Command::Memorize {
@@ -355,7 +355,7 @@ fn main() -> Result<()> {
         }
         Command::Import { directory } => {
             let dir = std::path::Path::new(&directory);
-            let result = store.import(dir, &embedder)?;
+            let result = store.import(dir, &mut embedder)?;
             eprintln!(
                 "Imported: {} created, {} updated, {} unchanged",
                 result.created, result.updated, result.unchanged

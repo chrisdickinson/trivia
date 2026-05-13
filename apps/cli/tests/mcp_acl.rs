@@ -34,7 +34,7 @@ fn test_app(acl: Acl) -> (axum::Router, Arc<Mutex<MemoryStore>>) {
 /// Seed memories with distinct tags for ACL testing.
 /// Uses real embeddings so recall KNN actually works.
 async fn seed(store: &Arc<Mutex<MemoryStore>>) {
-    let e = EMBEDDER.lock().await;
+    let mut e = EMBEDDER.lock().await;
     let emb1 = e.embed("test fact").unwrap();
     let emb2 = e.embed("private fact").unwrap();
     let emb3 = e.embed("project fact").unwrap();

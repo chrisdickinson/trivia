@@ -6,7 +6,7 @@ use sqlite_vec::sqlite3_vec_init;
 use std::path::Path;
 use std::sync::Once;
 use uuid::Uuid;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 static VEC_INIT: Once = Once::new();
 

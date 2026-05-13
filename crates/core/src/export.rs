@@ -152,11 +152,12 @@ impl MemoryStore {
             let tags: Vec<String> = serde_json::from_str(&row.tags_json).unwrap_or_default();
 
             // Get additional mnemonics (excluding title itself)
-            let mnemonics: Vec<String> = MemoryStore::get_mnemonics_for_memory(self.conn(), row.memory_id)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|m| m != &row.title)
-                .collect();
+            let mnemonics: Vec<String> =
+                MemoryStore::get_mnemonics_for_memory(self.conn(), row.memory_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| m != &row.title)
+                    .collect();
 
             // Collect links where this memory is the source
             let links: Vec<ExportLink> = link_rows
@@ -310,7 +311,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn import(&self, dir: &Path, embedder: &Embedder) -> Result<ImportResult> {
+    pub fn import(&self, dir: &Path, embedder: &mut Embedder) -> Result<ImportResult> {
         if !dir.is_dir() {
             return Err(anyhow!("not a directory: {}", dir.display()));
         }
@@ -369,7 +370,7 @@ impl MemoryStore {
                         )?;
                         self.conn().execute(
                             "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
-                            params![mn_id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                            params![mn_id, zerocopy::IntoBytes::as_bytes(embedding.as_slice())],
                         )?;
                         // Also update legacy memory_vectors
                         self.conn().execute(
@@ -378,7 +379,7 @@ impl MemoryStore {
                         )?;
                         self.conn().execute(
                             "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                            params![id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                            params![id, zerocopy::IntoBytes::as_bytes(embedding.as_slice())],
                         )?;
                         result.updated += 1;
                     }
@@ -408,12 +409,12 @@ impl MemoryStore {
                     )?;
                     self.conn().execute(
                         "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
-                        params![mn_id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                        params![mn_id, zerocopy::IntoBytes::as_bytes(embedding.as_slice())],
                     )?;
                     // Also insert legacy memory_vectors
                     self.conn().execute(
                         "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                        params![id, zerocopy::AsBytes::as_bytes(embedding.as_slice())],
+                        params![id, zerocopy::IntoBytes::as_bytes(embedding.as_slice())],
                     )?;
                     result.created += 1;
                     id
@@ -426,23 +427,29 @@ impl MemoryStore {
                     "INSERT OR IGNORE INTO mnemonics (memory_id, text) VALUES (?1, ?2)",
                     params![memory_id, mn_text],
                 )?;
-                let mn_id: Option<i64> = self.conn().query_row(
-                    "SELECT id FROM mnemonics WHERE text = ?1",
-                    params![mn_text],
-                    |row| row.get(0),
-                ).ok();
+                let mn_id: Option<i64> = self
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM mnemonics WHERE text = ?1",
+                        params![mn_text],
+                        |row| row.get(0),
+                    )
+                    .ok();
                 if let Some(mn_id) = mn_id {
                     // Check if already has vector
-                    let has_vec: bool = self.conn().query_row(
-                        "SELECT COUNT(*) FROM mnemonic_vectors WHERE mnemonic_id = ?1",
-                        params![mn_id],
-                        |row| row.get::<_, i64>(0),
-                    ).map(|c| c > 0)?;
+                    let has_vec: bool = self
+                        .conn()
+                        .query_row(
+                            "SELECT COUNT(*) FROM mnemonic_vectors WHERE mnemonic_id = ?1",
+                            params![mn_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|c| c > 0)?;
                     if !has_vec {
                         let emb = embedder.embed(mn_text)?;
                         self.conn().execute(
                             "INSERT INTO mnemonic_vectors (mnemonic_id, embedding) VALUES (?1, ?2)",
-                            params![mn_id, zerocopy::AsBytes::as_bytes(emb.as_slice())],
+                            params![mn_id, zerocopy::IntoBytes::as_bytes(emb.as_slice())],
                         )?;
                     }
                 }
@@ -560,8 +567,8 @@ mod tests {
 
         // Import into a fresh store
         let store2 = MemoryStore::in_memory()?;
-        let embedder = Embedder::new()?;
-        let result = store2.import(dir.path(), &embedder)?;
+        let mut embedder = Embedder::new()?;
+        let result = store2.import(dir.path(), &mut embedder)?;
 
         assert_eq!(result.created, 2);
         assert_eq!(result.updated, 0);
@@ -582,11 +589,11 @@ mod tests {
 
         // Import twice into same store
         let store2 = MemoryStore::in_memory()?;
-        let embedder = Embedder::new()?;
-        let r1 = store2.import(dir.path(), &embedder)?;
+        let mut embedder = Embedder::new()?;
+        let r1 = store2.import(dir.path(), &mut embedder)?;
         assert_eq!(r1.created, 2);
 
-        let r2 = store2.import(dir.path(), &embedder)?;
+        let r2 = store2.import(dir.path(), &mut embedder)?;
         assert_eq!(r2.unchanged, 2);
         assert_eq!(r2.created, 0);
 

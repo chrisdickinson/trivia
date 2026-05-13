@@ -520,12 +520,12 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 let dir = std::path::Path::new(&input.directory);
-                let embedder = app.embedder.lock().await;
+                let mut embedder = app.embedder.lock().await;
                 let result = app
                     .store
                     .lock()
                     .await
-                    .import(dir, &embedder)
+                    .import(dir, &mut embedder)
                     .tool_context("import failed")?;
                 Ok(CallToolResult::text(format!(
                     "Imported: {} created, {} updated, {} unchanged",
@@ -600,7 +600,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     }
                 }
 
-                let embedder = app.embedder.lock().await;
+                let mut embedder = app.embedder.lock().await;
                 let new_embedding = match &input.new_mnemonic {
                     Some(mn) => Some(
                         embedder.embed(mn).tool_context("embedding failed")?
