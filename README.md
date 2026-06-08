@@ -9,7 +9,7 @@ Semantic memory for Claude Code. Memorize facts, recall them by meaning, and let
 cargo install --path apps/cli
 
 # As a Claude Code plugin
-claude plugin add chrisdickinson/trivia
+claude plugin marketplace add chrisdickinson/trivia
 claude plugin install trivia
 ```
 
