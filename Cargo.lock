@@ -345,6 +345,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-buffer"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -543,6 +552,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,6 +690,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-common"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -780,8 +804,19 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer",
- "crypto-common",
+ "block-buffer 0.10.4",
+ "crypto-common 0.1.7",
+]
+
+[[package]]
+name = "digest"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+dependencies = [
+ "block-buffer 0.12.1",
+ "const-oid",
+ "crypto-common 0.2.2",
 ]
 
 [[package]]
@@ -1254,6 +1289,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
+
+[[package]]
 name = "hashlink"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,6 +1385,15 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "hybrid-array"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
+dependencies = [
+ "typenum",
+]
 
 [[package]]
 name = "hyper"
@@ -3096,7 +3151,7 @@ checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -3107,7 +3162,18 @@ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3585,6 +3651,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -3616,14 +3683,15 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-mcp"
-version = "0.8.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "371b1b22a76bd39f0e41563a4aa8e56e046f310742a5bba9962c46affa29e405"
+checksum = "96dd7df8b3c0f729ce9f294059f501fd8b1c53760bf61079c1433380fe66d76b"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "futures",
+ "getrandom 0.4.1",
  "http",
  "http-body-util",
  "hyper",
@@ -3634,21 +3702,25 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tower",
  "tower-mcp-macros",
  "tower-mcp-types",
+ "tower-resilience",
  "tower-service",
  "tracing",
+ "urlencoding",
  "uuid",
 ]
 
 [[package]]
 name = "tower-mcp-macros"
-version = "0.8.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4937d9ba1956a18db28f070210cfe792a6bbc389e4a725c2f7ea0674e594df4d"
+checksum = "4312d58b268a9e845fbe0ff5814fc309c9ae159eeafc97c27a0268ed378d0727"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3657,14 +3729,92 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-types"
-version = "0.8.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e3e53bf718e24344ea4bbd342c91318e94ef775f29f53fc04be905bed3f8b65"
+checksum = "6511f1f32c7cb7fd4525edc0eb4dcf307db8f7eceb2833ab24a37b4cc10cda61"
 dependencies = [
  "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "tower-resilience"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56009e7d0e1598a49bec874fad387318899f91d78ef3fec6a3a88cda92edd0d9"
+dependencies = [
+ "tower-resilience-bulkhead",
+ "tower-resilience-circuitbreaker",
+ "tower-resilience-coalesce",
+ "tower-resilience-core",
+ "tower-resilience-ratelimiter",
+]
+
+[[package]]
+name = "tower-resilience-bulkhead"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e8bc350768bc2375b62395795010ea6d21959fce122fec05e8302e77ae92f0b"
+dependencies = [
+ "futures",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-resilience-core",
+ "tower-service",
+]
+
+[[package]]
+name = "tower-resilience-circuitbreaker"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b33ffbe00fb9792f725623698de383e17344b65c68bfeb797d405fcafb51a60e"
+dependencies = [
+ "futures",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-resilience-core",
+]
+
+[[package]]
+name = "tower-resilience-coalesce"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be6bca7305e8464e056dbd2a23b9947e709818649ff37b4ec6b749c01e1359e1"
+dependencies = [
+ "hashbrown 0.17.1",
+ "parking_lot",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-resilience-core",
+ "tower-service",
+]
+
+[[package]]
+name = "tower-resilience-core"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80e6c217d8b2cc623d72fb9a1a883f2c9decd2035d09aff1dd66def7390dd69c"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "tower-resilience-ratelimiter"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaba5441d8913c63d9140f0097f4c077a0b34d03a1b365a492e78c98c99ae9bf"
+dependencies = [
+ "futures",
+ "tokio",
+ "tower",
+ "tower-resilience-core",
 ]
 
 [[package]]
@@ -3721,7 +3871,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "tokio",
  "tower",
  "tower-http",
@@ -3741,7 +3891,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
- "sha2",
+ "sha2 0.10.9",
  "sqlite-vec",
  "tempfile",
  "toml",
@@ -3774,9 +3924,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.19.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicode-ident"
@@ -3888,6 +4038,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf-8"
