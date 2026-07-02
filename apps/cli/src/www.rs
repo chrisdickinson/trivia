@@ -112,8 +112,15 @@ pub async fn serve(
         config.clone(),
         acl.clone(),
     );
+    // Auto-reinitialize unknown/stale session IDs instead of returning
+    // JSON-RPC -32005 SessionNotFound. Without this, a client reconnecting
+    // with a session ID we no longer hold (server restart, session expiry,
+    // or eviction) gets hard-failed. Per-user authorization rides on the
+    // OAuth bearer token via `require_auth`, not the MCP session identity,
+    // so recovering the session with synthetic client info is safe here.
     let mcp = HttpTransport::new(mcp_router)
         .disable_origin_validation()
+        .auto_reinitialize_sessions(true)
         .into_router_at("/mcp");
 
     // Auth middleware state
