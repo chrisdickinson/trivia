@@ -2,6 +2,10 @@
 members = ["apps/*", "crates/*"]
 resolver = "2"
 
+[workspace.package]
+version = "0.11.0"
+edition = "2024"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
