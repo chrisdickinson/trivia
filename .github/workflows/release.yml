@@ -44,6 +44,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: trivia-aarch64-apple-darwin.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: trivia-x86_64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: trivia-x86_64-pc-windows-msvc.zip
@@ -63,7 +66,9 @@ jobs:
         run: mkdir -p apps/cli/www/dist && tar xzf trivia-www.tar.gz -C apps/cli/www/dist
 
       - name: Build release binary
-        run: cargo build --release -p trivia-cli
+        # s3vectors ships in release binaries (and thus the Docker image); it is
+        # opt-in at runtime via `backend = "s3vectors"` / TRIVIA_BACKEND.
+        run: cargo build --release -p trivia-cli --features s3vectors
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'

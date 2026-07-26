@@ -2,10 +2,16 @@
 name = "trivia-cli"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [[bin]]
 name = "trivia"
 path = "src/main.rs"
+
+[features]
+# Passthrough to trivia-core's S3 Vectors backend. Enabled in release builds
+# (see .github/workflows/release.yml); off by default for a lean local build.
+s3vectors = ["trivia-core/s3vectors"]
 
 [dependencies]
 trivia-core = { path = "../../crates/core" }

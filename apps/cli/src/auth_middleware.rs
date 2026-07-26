@@ -6,9 +6,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tokio::sync::Mutex;
 use tower_mcp::oauth::token::TokenClaims;
-use trivia_core::MemoryStore;
+use trivia_core::AuthBackend;
 
 use crate::acl::Acl;
 use crate::oauth;
@@ -16,7 +15,7 @@ use crate::oauth;
 /// State needed by the auth middleware.
 #[derive(Clone)]
 pub struct AuthState {
-    pub store: Arc<Mutex<MemoryStore>>,
+    pub store: Arc<dyn AuthBackend>,
     pub external_url: String,
     /// Fallback ACL when auth is disabled (from --share flag).
     pub fallback_acl: String,
@@ -81,15 +80,13 @@ pub async fn require_auth(
     }
 
     // Try session cookie
-    if let Some(session_id) = oauth::extract_session_cookie(&headers) {
-        let store = auth_state.store.lock().await;
-        if let Ok(Some((_sess, user))) = store.get_session(&session_id) {
-            drop(store);
-            request
-                .extensions_mut()
-                .insert(make_claims(Some(user.username), &user.acl));
-            return next.run(request).await;
-        }
+    if let Some(session_id) = oauth::extract_session_cookie(&headers)
+        && let Ok(Some((_sess, user))) = auth_state.store.get_session(&session_id).await
+    {
+        request
+            .extensions_mut()
+            .insert(make_claims(Some(user.username), &user.acl));
+        return next.run(request).await;
     }
 
     (

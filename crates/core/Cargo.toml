@@ -2,10 +2,16 @@
 name = "trivia-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 build = "build.rs"
 
 [build-dependencies]
 sha2 = { workspace = true }
+
+[features]
+# Enable the Amazon S3 Vectors backend (pulls in the AWS SDK). Off by default
+# to keep the standard build lean and offline; the Dockerfile enables it.
+s3vectors = ["dep:aws-config", "dep:aws-sdk-s3vectors", "dep:aws-smithy-types"]
 
 [dependencies]
 rusqlite = { workspace = true }
@@ -21,6 +27,13 @@ toml = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# S3 Vectors backend (optional)
+aws-config = { version = "1", optional = true }
+aws-sdk-s3vectors = { version = "1", optional = true }
+aws-smithy-types = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

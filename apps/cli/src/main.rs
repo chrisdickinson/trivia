@@ -4,13 +4,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use trivia_core::{Embedder, MemoryStore, TriviaConfig};
+use trivia_core::{
+    Backends, Embedder, ScoringConfig, TriviaConfig, build_backends, build_memory_backend,
+};
 
 use trivia_cli::{acl, mcp, www};
 
 #[derive(Parser)]
 #[command(name = "trivia", about = "Semantic memory store")]
 struct Cli {
+    /// Storage backend: "sqlite" (default) or "s3vectors". Overrides config/env.
+    #[arg(long, global = true)]
+    backend: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -207,25 +212,36 @@ fn load_config() -> TriviaConfig {
         .unwrap_or_default()
 }
 
+fn scoring_from(config: &TriviaConfig) -> ScoringConfig {
+    ScoringConfig {
+        boost_tags: config.recall.tags.clone(),
+        ..Default::default()
+    }
+}
+
 fn main() -> Result<()> {
     let config = load_config();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run(config))
+}
 
+async fn run(config: TriviaConfig) -> Result<()> {
     // Auto-detect: if stdin is not a TTY and no args, run MCP server
     if !io::stdin().is_terminal() && std::env::args().count() == 1 {
-        let mut store = MemoryStore::new(&db_path(&config))?;
-        if !config.recall.tags.is_empty() {
-            store.set_boost_tags(config.recall.tags.clone());
-        }
+        let memory =
+            build_memory_backend(&config, &db_path(&config), scoring_from(&config), None).await?;
         let embedder = Embedder::new()?;
-        let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(mcp::serve(store, embedder, config));
+        return mcp::serve(memory, embedder, config).await;
     }
 
     let cli = Cli::parse();
-    let mut store = MemoryStore::new(&db_path(&config))?;
-    if !config.recall.tags.is_empty() {
-        store.set_boost_tags(config.recall.tags.clone());
-    }
+    let Backends { memory, auth } = build_backends(
+        &config,
+        &db_path(&config),
+        scoring_from(&config),
+        cli.backend.as_deref(),
+    )
+    .await?;
     let mut embedder = Embedder::new()?;
 
     match cli.command {
@@ -236,7 +252,7 @@ fn main() -> Result<()> {
         } => {
             let tags = TriviaConfig::merge_tags(&config.memorize.tags, &tag);
             let embedding = embedder.embed(&mnemonic)?;
-            store.memorize(&mnemonic, &content, &tags, &embedding)?;
+            memory.memorize(&mnemonic, &content, &tags, &embedding).await?;
             eprintln!("Memorized: {mnemonic}");
         }
         Command::Recall {
@@ -251,7 +267,7 @@ fn main() -> Result<()> {
             } else {
                 Some(tag.as_slice())
             };
-            let memories = store.recall(&embedding, limit, tags, None, None)?;
+            let memories = memory.recall(&embedding, limit, tags, None, None).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&memories)?);
@@ -312,7 +328,7 @@ fn main() -> Result<()> {
             if !useful && !not_useful {
                 anyhow::bail!("specify --useful or --not-useful");
             }
-            store.rate(&mnemonic, useful)?;
+            memory.rate(&mnemonic, useful).await?;
             let label = if useful { "useful" } else { "not useful" };
             eprintln!("Rated {mnemonic} as {label}");
         }
@@ -321,16 +337,16 @@ fn main() -> Result<()> {
             target,
             link_type,
         } => {
-            store.link(&source, &target, &link_type)?;
+            memory.link(&source, &target, &link_type).await?;
             println!("Linked: {} --[{}]--> {}", source, link_type, target);
         }
         Command::Merge { keep, discard } => {
             let embedding = embedder.embed(&keep)?;
-            store.merge(&keep, &discard, &embedding)?;
+            memory.merge(&keep, &discard, &embedding).await?;
             eprintln!("Merged: {keep} absorbed {discard}");
         }
         Command::Links { mnemonic } => {
-            let links = store.get_links(&mnemonic)?;
+            let links = memory.get_links(&mnemonic).await?;
             if links.is_empty() {
                 println!("No links found for: {mnemonic}");
             } else {
@@ -350,20 +366,19 @@ fn main() -> Result<()> {
             } else {
                 Some(merged.as_slice())
             };
-            store.export(dir, tags)?;
+            memory.export(dir, tags).await?;
             eprintln!("Exported to: {directory}");
         }
         Command::Import { directory } => {
             let dir = std::path::Path::new(&directory);
-            let result = store.import(dir, &mut embedder)?;
+            let result = memory.import(dir, &mut embedder).await?;
             eprintln!(
                 "Imported: {} created, {} updated, {} unchanged",
                 result.created, result.updated, result.unchanged
             );
         }
         Command::Mcp => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(mcp::serve(store, embedder, config))?;
+            mcp::serve(memory, embedder, config).await?;
         }
         Command::Www { share } => {
             let bind_addr = std::env::var("BIND_ADDR")
@@ -375,11 +390,10 @@ fn main() -> Result<()> {
                 Some(spec) => acl::Acl::parse(&spec)?,
                 None => acl::Acl::closed(),
             };
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(www::serve(store, embedder, &bind_addr, &base_path, config, acl))?;
+            www::serve(memory, auth, embedder, &bind_addr, &base_path, config, acl).await?;
         }
         Command::ListTags { json } => {
-            let tags = store.list_tags()?;
+            let tags = memory.list_tags().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tags)?);
             } else if tags.is_empty() {
@@ -392,11 +406,11 @@ fn main() -> Result<()> {
         }
         Command::AddMnemonic { title, alias } => {
             let embedding = embedder.embed(&alias)?;
-            store.add_mnemonic(&title, &alias, &embedding)?;
+            memory.add_mnemonic(&title, &alias, &embedding).await?;
             eprintln!("Added mnemonic alias \"{alias}\" to \"{title}\"");
         }
         Command::RemoveMnemonic { title, alias } => {
-            store.remove_mnemonic(&title, &alias)?;
+            memory.remove_mnemonic(&title, &alias).await?;
             eprintln!("Removed mnemonic alias \"{alias}\" from \"{title}\"");
         }
         Command::Automerge {
@@ -420,7 +434,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            let summaries = store.list_all_summaries()?;
+            let summaries = memory.list_all_summaries().await?;
             let mut discarded: HashSet<String> = HashSet::new();
             let mut merged_count = 0;
             let stdin = io::stdin();
@@ -435,8 +449,9 @@ fn main() -> Result<()> {
                 let mut exclude = discarded.clone();
                 exclude.insert(summary.mnemonic.clone());
 
-                let candidates =
-                    store.find_merge_candidates(&content_embedding, threshold, &exclude, 1)?;
+                let candidates = memory
+                    .find_merge_candidates(&content_embedding, threshold, &exclude, 1)
+                    .await?;
 
                 let candidate = match candidates.first() {
                     Some(c) => c,
@@ -482,20 +497,20 @@ fn main() -> Result<()> {
                 match choice.as_str() {
                     "y" | "yes" => {
                         let emb = embedder.embed(&summary.mnemonic)?;
-                        store.merge(&summary.mnemonic, &candidate.mnemonic, &emb)?;
+                        memory.merge(&summary.mnemonic, &candidate.mnemonic, &emb).await?;
                         discarded.insert(candidate.mnemonic.clone());
                         merged_count += 1;
                         eprintln!("  {GREEN}Merged: {BOLD}{}{RESET}{GREEN} absorbed {}{RESET}", summary.mnemonic, candidate.mnemonic);
                     }
                     "s" | "swap" => {
                         let emb = embedder.embed(&candidate.mnemonic)?;
-                        store.merge(&candidate.mnemonic, &summary.mnemonic, &emb)?;
+                        memory.merge(&candidate.mnemonic, &summary.mnemonic, &emb).await?;
                         discarded.insert(summary.mnemonic.clone());
                         merged_count += 1;
                         eprintln!("  {GREEN}Merged: {BOLD}{}{RESET}{GREEN} absorbed {}{RESET}", candidate.mnemonic, summary.mnemonic);
                     }
                     "l" | "link" => {
-                        store.link(&summary.mnemonic, &candidate.mnemonic, "related")?;
+                        memory.link(&summary.mnemonic, &candidate.mnemonic, "related").await?;
                         eprintln!("  Linked: {} \u{2194} {}", summary.mnemonic, candidate.mnemonic);
                     }
                     "q" | "quit" => {
@@ -515,18 +530,18 @@ fn main() -> Result<()> {
                 AdminCommand::AddUser { username, acl: acl_spec } => {
                     // Validate the ACL spec parses
                     acl::Acl::parse(&acl_spec)?;
-                    let user = store.create_user(&username, &acl_spec)?;
+                    let user = auth.create_user(&username, &acl_spec).await?;
                     eprintln!("Created user: {} (acl: {})", user.username, user.acl);
                 }
                 AdminCommand::RemoveUser { username } => {
-                    if store.delete_user(&username)? {
+                    if auth.delete_user(&username).await? {
                         eprintln!("Removed user: {username}");
                     } else {
                         eprintln!("User not found: {username}");
                     }
                 }
                 AdminCommand::ListUsers => {
-                    let users = store.list_users()?;
+                    let users = auth.list_users().await?;
                     if users.is_empty() {
                         println!("No users.");
                     } else {
@@ -541,18 +556,18 @@ fn main() -> Result<()> {
                     client_id,
                     client_secret,
                 } => {
-                    let prov = store.create_provider(&name, &provider_type, &client_id, &client_secret)?;
+                    let prov = auth.create_provider(&name, &provider_type, &client_id, &client_secret).await?;
                     eprintln!("Created provider: {} (type: {})", prov.name, prov.provider_type);
                 }
                 AdminCommand::RemoveProvider { name } => {
-                    if store.delete_provider(&name)? {
+                    if auth.delete_provider(&name).await? {
                         eprintln!("Removed provider: {name}");
                     } else {
                         eprintln!("Provider not found: {name}");
                     }
                 }
                 AdminCommand::ListProviders => {
-                    let providers = store.list_providers()?;
+                    let providers = auth.list_providers().await?;
                     if providers.is_empty() {
                         println!("No providers.");
                     } else {
@@ -568,12 +583,12 @@ fn main() -> Result<()> {
                     provider_username,
                     provider_user_id,
                 } => {
-                    let user = store.get_user_by_username(&username)?
+                    let user = auth.get_user_by_username(&username).await?
                         .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
-                    let prov = store.get_provider_by_name(&provider)?
+                    let prov = auth.get_provider_by_name(&provider).await?
                         .ok_or_else(|| anyhow::anyhow!("provider not found: {provider}"))?;
                     let puid = provider_user_id.as_deref().unwrap_or(&provider_username);
-                    store.link_identity(user.id, prov.id, &provider_username, puid)?;
+                    auth.link_identity(user.id, prov.id, &provider_username, puid).await?;
                     eprintln!(
                         "Linked {username} to {provider} as {provider_username} (id: {puid})"
                     );

@@ -11,6 +11,10 @@ A semantic memory store for Claude Code. Memorize facts with a mnemonic key, rec
 ```bash
 just build          # cargo build --release
 just test           # cargo test --workspace
+# S3 Vectors backend is optional & off by default:
+#   cargo build --release -p trivia-cli --features s3vectors
+# The workspace uses resolver "3" + rust-version = "1.92" so the MSRV-aware
+# resolver pins AWS SDK versions that build on the pinned toolchain.
 just www            # serve web UI (Axum, default port 3000)
 just vite           # React dev server (Vite, proxies to Axum API)
 just dev            # www + vite in parallel
@@ -32,7 +36,8 @@ cargo test -p trivia-core -- test_name
 
 ### `crates/core` (trivia-core)
 
-- **`store.rs`** — `MemoryStore` wrapping a single `rusqlite::Connection`. SQLite schema: `memories` table, `memory_vectors` (sqlite-vec, float[384] KNN via L2), `memory_links` (typed edges), `memory_fts` (FTS5 with porter stemmer, synced via triggers). Additive migration — no version table, `ADD COLUMN IF NOT EXISTS` pattern.
+- **`store.rs`** — `MemoryStore` wrapping a single `rusqlite::Connection`. SQLite schema: `memories` table, `memory_vectors` (sqlite-vec, float[384] KNN via L2), `memory_links` (typed edges), `memory_fts` (FTS5 with porter stemmer, synced via triggers). Additive migration — no version table, `ADD COLUMN IF NOT EXISTS` pattern. `recall` = `recall_candidates` (initial KNN + FTS set) → pure `rerank(...)` → `bump_recall_stats`.
+- **`backend/`** — pluggable storage. `MemoryBackend` (async trait) abstracts storage, retrieval, and the *initial KNN*; the pure `rerank` runs identically for every backend. `AuthBackend` (async trait) is the web server's users/OAuth/sessions store — always SQLite. `SqliteBackend` wraps `MemoryStore` behind a `tokio::Mutex` and implements both. `S3VectorsBackend` (feature `s3vectors`) uses `aws-sdk-s3vectors` — `QueryVectors` KNN, records denormalized into each vector's `record` metadata; export/import fall back to the trait's portable-markdown defaults. `build_backends`/`build_memory_backend` select by config/env/`--backend`.
 - **`embedder.rs`** — `Embedder` wrapping `fastembed::TextEmbedding` (AllMiniLM-L6-V2, 384 dims). Embeds the **mnemonic**, not the content.
 - **`config.rs`** — `TriviaConfig` from `trivia.toml`, discovered by walking up from `CLAUDE_PLUGIN_ROOT` or CWD.
 - **`export.rs`** — Markdown + YAML frontmatter export/import. Two-pass import (memories first, then links by UUID).

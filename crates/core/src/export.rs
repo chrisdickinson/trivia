@@ -52,7 +52,7 @@ pub struct ImportResult {
     pub unchanged: usize,
 }
 
-fn slugify(s: &str) -> String {
+pub(crate) fn slugify(s: &str) -> String {
     let slug: String = s
         .to_lowercase()
         .chars()
@@ -254,7 +254,7 @@ impl MemoryStore {
         &self,
         dir: &Path,
         tags: Option<&[String]>,
-        filter: impl Fn(&[String]) -> bool,
+        filter: &(dyn Fn(&[String]) -> bool + Send + Sync),
     ) -> Result<()> {
         std::fs::create_dir_all(dir)?;
 

@@ -10,8 +10,6 @@ if [ -x "$BIN" ]; then
   exit 0
 fi
 
-mkdir -p "$BIN_DIR"
-
 # Detect platform
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -26,25 +24,37 @@ case "$OS" in
   linux)  TARGET="${ARCH}-unknown-linux-gnu" ;;
   darwin) TARGET="${ARCH}-apple-darwin" ;;
   msys*|mingw*|cygwin*)
-    echo "On Windows, run: powershell -ExecutionPolicy Bypass -File scripts/install.ps1" >&2
-    exit 1
+    exec powershell.exe -ExecutionPolicy Bypass -File "${PLUGIN_ROOT}/scripts/install.ps1"
     ;;
   *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-# Try downloading from GitHub releases
+mkdir -p "$BIN_DIR"
+
 REPO="chrisdickinson/trivia"
-RELEASE_URL="https://github.com/${REPO}/releases/latest/download/trivia-${TARGET}.tar.gz"
+
+# Prefer the release matching this plugin checkout; fall back to latest.
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "${PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null | head -1 || true)"
+URLS=()
+if [ -n "$VERSION" ]; then
+  URLS+=("https://github.com/${REPO}/releases/download/v${VERSION}/trivia-${TARGET}.tar.gz")
+fi
+URLS+=("https://github.com/${REPO}/releases/latest/download/trivia-${TARGET}.tar.gz")
 
 if command -v curl &>/dev/null; then
-  HTTP_CODE=$(curl -sL -o /tmp/trivia-release.tar.gz -w "%{http_code}" "$RELEASE_URL" 2>/dev/null || echo "000")
-  if [ "$HTTP_CODE" = "200" ]; then
-    tar -xzf /tmp/trivia-release.tar.gz -C "$BIN_DIR"
-    chmod +x "$BIN"
-    rm -f /tmp/trivia-release.tar.gz
-    exit 0
-  fi
-  rm -f /tmp/trivia-release.tar.gz
+  # Stage inside bin/ so the final mv is a same-filesystem rename — concurrent
+  # installs (SessionStart hook + MCP wrapper) can't clobber a half-written binary.
+  STAGE="$(mktemp -d "${BIN_DIR}/.install.XXXXXX")"
+  trap 'rm -rf "$STAGE"' EXIT
+
+  for URL in "${URLS[@]}"; do
+    if curl -fsSL -o "${STAGE}/release.tar.gz" "$URL" 2>/dev/null; then
+      tar -xzf "${STAGE}/release.tar.gz" -C "$STAGE"
+      chmod +x "${STAGE}/trivia"
+      mv -f "${STAGE}/trivia" "$BIN"
+      exit 0
+    fi
+  done
 fi
 
 # Fallback: build from source
@@ -58,8 +68,9 @@ if command -v cargo &>/dev/null; then
   fi
 
   cargo build --manifest-path "${PLUGIN_ROOT}/apps/cli/Cargo.toml" --release --quiet
-  cp "${PLUGIN_ROOT}/target/release/trivia" "$BIN"
-  chmod +x "$BIN"
+  cp "${PLUGIN_ROOT}/target/release/trivia" "${BIN}.tmp.$$"
+  chmod +x "${BIN}.tmp.$$"
+  mv -f "${BIN}.tmp.$$" "$BIN"
   exit 0
 fi
 

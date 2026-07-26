@@ -13,6 +13,21 @@ pub struct TriviaConfig {
     pub database: Option<String>,
     /// External URL for OAuth redirect URIs (e.g. "https://trivia.example.com")
     pub external_url: Option<String>,
+    /// Storage backend: "sqlite" (default) or "s3vectors".
+    pub backend: Option<String>,
+    /// Settings for the S3 Vectors backend (used when `backend = "s3vectors"`).
+    #[serde(default)]
+    pub s3vectors: S3VectorsConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct S3VectorsConfig {
+    /// S3 vector bucket name.
+    pub bucket: Option<String>,
+    /// Vector index name within the bucket.
+    pub index: Option<String>,
+    /// AWS region (falls back to the standard AWS env/config chain if unset).
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_mcp::transport::http::HttpTransport;
-use trivia_core::{Embedder, MemoryStore, TriviaConfig};
+use trivia_core::{AuthBackend, Embedder, MemoryBackend, TriviaConfig};
 
 use crate::acl::Acl;
 use crate::auth_middleware::{AuthState, require_auth};
@@ -38,7 +38,7 @@ pub fn normalize_base_path(raw: &str) -> String {
 }
 
 struct AppState {
-    store: Arc<Mutex<MemoryStore>>,
+    store: Arc<dyn MemoryBackend>,
     embedder: Arc<Mutex<Embedder>>,
 }
 
@@ -59,14 +59,14 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 }
 
 pub async fn serve(
-    store: MemoryStore,
+    memory: Arc<dyn MemoryBackend>,
+    auth: Arc<dyn AuthBackend>,
     embedder: Embedder,
     bind_addr: &str,
     base_path: &str,
     config: TriviaConfig,
     acl: Acl,
 ) -> Result<()> {
-    let store = Arc::new(Mutex::new(store));
     let embedder = Arc::new(Mutex::new(embedder));
     let base_path = base_path.to_string();
 
@@ -77,13 +77,10 @@ pub async fn serve(
         .unwrap_or_else(|| format!("http://{bind_addr}"));
 
     // Check if auth providers are configured
-    let auth_enabled = {
-        let s = store.lock().await;
-        s.has_auth_providers().unwrap_or(false)
-    };
+    let auth_enabled = auth.has_auth_providers().await.unwrap_or(false);
 
     let state = Arc::new(AppState {
-        store: store.clone(),
+        store: memory.clone(),
         embedder: embedder.clone(),
     });
 
@@ -107,7 +104,7 @@ pub async fn serve(
     // Mount MCP over HTTP at /mcp
     let acl = Arc::new(acl);
     let mcp_router = crate::mcp::build_mcp_router(
-        store.clone(),
+        memory.clone(),
         embedder,
         config.clone(),
         acl.clone(),
@@ -125,7 +122,7 @@ pub async fn serve(
 
     // Auth middleware state
     let auth_state = AuthState {
-        store: store.clone(),
+        store: auth.clone(),
         external_url: external_url.clone(),
         fallback_acl: acl.to_string(),
         auth_enabled,
@@ -133,7 +130,7 @@ pub async fn serve(
 
     // OAuth routes (always public, no auth middleware)
     let oauth_state = OAuthState {
-        store: store.clone(),
+        store: auth.clone(),
         external_url: external_url.clone(),
         base_path: base_path.clone(),
     };
@@ -193,8 +190,7 @@ pub async fn serve(
 // --- API handlers ---
 
 async fn list_memories(State(state): State<Arc<AppState>>) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    let summaries = store.list_all_summaries()?;
+    let summaries = state.store.list_all_summaries().await?;
     Ok(axum::Json(summaries))
 }
 
@@ -213,8 +209,7 @@ async fn create_memory(
     let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.mnemonic)?;
     drop(embedder);
-    let store = state.store.lock().await;
-    store.memorize(&body.mnemonic, &body.content, &body.tags, &embedding)?;
+    state.store.memorize(&body.mnemonic, &body.content, &body.tags, &embedding).await?;
     Ok((StatusCode::CREATED, axum::Json(serde_json::json!({"ok": true}))))
 }
 
@@ -222,8 +217,7 @@ async fn get_memory(
     State(state): State<Arc<AppState>>,
     Path(mnemonic): Path<String>,
 ) -> AppResult<Response> {
-    let store = state.store.lock().await;
-    match store.get_memory_by_mnemonic(&mnemonic)? {
+    match state.store.get_memory_by_mnemonic(&mnemonic).await? {
         Some(mem) => Ok(axum::Json(mem).into_response()),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
@@ -250,11 +244,10 @@ async fn update_memory(
     let embedding = embedder.embed(new_mnemonic)?;
     drop(embedder);
 
-    let store = state.store.lock().await;
     if renaming {
-        store.rename_memory(&old_mnemonic, new_mnemonic, &embedding)?;
+        state.store.rename_memory(&old_mnemonic, new_mnemonic, &embedding).await?;
     }
-    store.update_memory(new_mnemonic, &body.content, &body.tags, &embedding)?;
+    state.store.update_memory(new_mnemonic, &body.content, &body.tags, &embedding).await?;
 
     if renaming {
         Ok(axum::Json(serde_json::json!({"ok": true, "mnemonic": new_mnemonic})).into_response())
@@ -267,8 +260,7 @@ async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Path(mnemonic): Path<String>,
 ) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    let deleted = store.delete_memory(&mnemonic)?;
+    let deleted = state.store.delete_memory(&mnemonic).await?;
     if deleted {
         Ok(axum::Json(serde_json::json!({"ok": true})).into_response())
     } else {
@@ -286,8 +278,7 @@ async fn rate_memory(
     Path(mnemonic): Path<String>,
     axum::Json(body): axum::Json<RateReq>,
 ) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    store.rate(&mnemonic, body.useful)?;
+    state.store.rate(&mnemonic, body.useful).await?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
@@ -317,9 +308,8 @@ struct GraphEdge {
 }
 
 async fn get_graph(State(state): State<Arc<AppState>>) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    let summaries = store.list_all_summaries()?;
-    let links = store.get_all_links()?;
+    let summaries = state.store.list_all_summaries().await?;
+    let links = state.store.get_all_links().await?;
 
     let nodes: Vec<GraphNode> = summaries
         .into_iter()
@@ -371,14 +361,15 @@ async fn search_memories(
         .tags
         .filter(|s| !s.is_empty())
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
-    let store = state.store.lock().await;
-    let results = store.recall(&embedding, params.limit, tag_list.as_deref(), None, None)?;
+    let results = state
+        .store
+        .recall(&embedding, params.limit, tag_list.as_deref(), None, None)
+        .await?;
     Ok(axum::Json(results))
 }
 
 async fn list_tags(State(state): State<Arc<AppState>>) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    let tags = store.list_tags()?;
+    let tags = state.store.list_tags().await?;
     Ok(axum::Json(tags))
 }
 
@@ -395,8 +386,7 @@ async fn merge_memories(
     let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.keep)?;
     drop(embedder);
-    let store = state.store.lock().await;
-    store.merge(&body.keep, &body.discard, &embedding)?;
+    state.store.merge(&body.keep, &body.discard, &embedding).await?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
@@ -416,8 +406,7 @@ async fn create_link(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<LinkReq>,
 ) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    store.link(&body.source, &body.target, &body.link_type)?;
+    state.store.link(&body.source, &body.target, &body.link_type).await?;
     Ok((StatusCode::CREATED, axum::Json(serde_json::json!({"ok": true}))))
 }
 
@@ -425,8 +414,7 @@ async fn remove_link(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<LinkReq>,
 ) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    store.unlink(&body.source, &body.target, &body.link_type)?;
+    state.store.unlink(&body.source, &body.target, &body.link_type).await?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
@@ -443,8 +431,7 @@ async fn add_mnemonic_handler(
     let mut embedder = state.embedder.lock().await;
     let embedding = embedder.embed(&body.text)?;
     drop(embedder);
-    let store = state.store.lock().await;
-    store.add_mnemonic(&title, &body.text, &embedding)?;
+    state.store.add_mnemonic(&title, &body.text, &embedding).await?;
     Ok((StatusCode::CREATED, axum::Json(serde_json::json!({"ok": true}))))
 }
 
@@ -453,8 +440,7 @@ async fn remove_mnemonic_handler(
     Path(title): Path<String>,
     axum::Json(body): axum::Json<MnemonicReq>,
 ) -> AppResult<impl IntoResponse> {
-    let store = state.store.lock().await;
-    store.remove_mnemonic(&title, &body.text)?;
+    state.store.remove_mnemonic(&title, &body.text).await?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
