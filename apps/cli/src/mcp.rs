@@ -306,6 +306,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
     let s = state.clone();
     let recall = ToolBuilder::new("recall")
         .description("Retrieve previously memorized facts by semantic similarity. Provide a natural language query describing what you're looking for. Use `full_text_search` alongside it to boost results that contain a specific keyword or phrase — this is useful when you know the exact term but want semantic ranking too. Use min_score to filter low-relevance results. Use exclude_tags to hide irrelevant categories.")
+        .read_only()
         .extractor_handler(
             s,
             |State(app): State<Arc<AppState>>,
@@ -538,6 +539,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
     let s = state.clone();
     let list_tags = ToolBuilder::new("list-tags")
         .description("List all unique tags with the number of memories using each tag.")
+        .read_only()
         .extractor_handler(
             s,
             |State(app): State<Arc<AppState>>,
