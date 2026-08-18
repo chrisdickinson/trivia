@@ -1,7 +1,7 @@
 {
   "name": "trivia",
   "description": "Semantic memory for Claude Code — memorize and recall project context",
-  "version": "0.1.0",
+  "version": "0.12.0",
   "author": {
     "name": "Chris Dickinson"
   },
