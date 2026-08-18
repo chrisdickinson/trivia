@@ -372,3 +372,38 @@ async fn closed_acl_denies_everything() {
     assert!(!is_error(&resp));
     assert_eq!(result_text(&resp), "No tags found.");
 }
+
+#[tokio::test]
+async fn query_tools_are_marked_read_only() {
+    let (app, _) = test_app(Acl::open());
+    let sid = init(&app).await;
+
+    let (resp, _) = post(
+        &app,
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected tools array: {resp}"));
+    let annotations = |name: &str| -> &Value {
+        &tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not listed"))["annotations"]
+    };
+
+    for name in ["recall", "list-tags"] {
+        assert_eq!(
+            annotations(name)["readOnlyHint"],
+            json!(true),
+            "{name} should declare readOnlyHint"
+        );
+    }
+    assert_ne!(
+        annotations("memorize")["readOnlyHint"],
+        json!(true),
+        "memorize must not claim to be read-only"
+    );
+}
