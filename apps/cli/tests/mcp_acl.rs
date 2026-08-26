@@ -9,7 +9,7 @@ use tower_mcp::transport::http::HttpTransport;
 
 use trivia_cli::acl::Acl;
 use trivia_cli::mcp::build_mcp_router;
-use trivia_core::{Embedder, MemoryStore, TriviaConfig};
+use trivia_core::{Embedder, MemoryBackend, ScoringConfig, SqliteBackend, TriviaConfig};
 
 // Shared embedder — model loading is expensive, do it once across all tests.
 static EMBEDDER: LazyLock<Arc<Mutex<Embedder>>> = LazyLock::new(|| {
@@ -17,8 +17,9 @@ static EMBEDDER: LazyLock<Arc<Mutex<Embedder>>> = LazyLock::new(|| {
 });
 
 /// Build an MCP HTTP app with the given ACL.
-fn test_app(acl: Acl) -> (axum::Router, Arc<Mutex<MemoryStore>>) {
-    let store = Arc::new(Mutex::new(MemoryStore::in_memory().unwrap()));
+fn test_app(acl: Acl) -> (axum::Router, Arc<dyn MemoryBackend>) {
+    let store: Arc<dyn MemoryBackend> =
+        Arc::new(SqliteBackend::in_memory(ScoringConfig::default()).unwrap());
     let mcp = build_mcp_router(
         store.clone(),
         EMBEDDER.clone(),
@@ -33,25 +34,25 @@ fn test_app(acl: Acl) -> (axum::Router, Arc<Mutex<MemoryStore>>) {
 
 /// Seed memories with distinct tags for ACL testing.
 /// Uses real embeddings so recall KNN actually works.
-async fn seed(store: &Arc<Mutex<MemoryStore>>) {
+async fn seed(store: &Arc<dyn MemoryBackend>) {
     let mut e = EMBEDDER.lock().await;
     let emb1 = e.embed("test fact").unwrap();
     let emb2 = e.embed("private fact").unwrap();
     let emb3 = e.embed("project fact").unwrap();
     drop(e);
 
-    let s = store.lock().await;
-    s.memorize("test fact", "hello world", &["test".into()], &emb1)
+    store
+        .memorize("test fact", "hello world", &["test".into()], &emb1)
+        .await
         .unwrap();
-    s.memorize("private fact", "secret stuff", &["private".into()], &emb2)
+    store
+        .memorize("private fact", "secret stuff", &["private".into()], &emb2)
+        .await
         .unwrap();
-    s.memorize(
-        "project fact",
-        "project data",
-        &["project".into()],
-        &emb3,
-    )
-    .unwrap();
+    store
+        .memorize("project fact", "project data", &["project".into()], &emb3)
+        .await
+        .unwrap();
 }
 
 /// POST a JSON-RPC request. Returns (parsed response, session ID).

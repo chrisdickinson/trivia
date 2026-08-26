@@ -10,12 +10,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use trivia_core::MemoryStore;
+use trivia_core::AuthBackend;
 
 use crate::providers::Provider;
 
-pub type SharedStore = Arc<Mutex<MemoryStore>>;
+pub type SharedStore = Arc<dyn AuthBackend>;
 
 #[derive(Clone)]
 pub struct OAuthState {
@@ -98,8 +97,10 @@ async fn register_client(
         return Err(AppError::bad_request("redirect_uris must not be empty"));
     }
 
-    let store = state.store.lock().await;
-    let (client, secret) = store.register_client(&body.redirect_uris, body.client_name.as_deref())?;
+    let (client, secret) = state
+        .store
+        .register_client(&body.redirect_uris, body.client_name.as_deref())
+        .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -145,18 +146,18 @@ async fn authorize(
         ));
     }
 
-    let store = state.store.lock().await;
-
     // Validate client
-    let client = store
-        .get_client(&params.client_id)?
+    let client = state
+        .store
+        .get_client(&params.client_id)
+        .await?
         .ok_or_else(|| AppError::bad_request("unknown client_id"))?;
     if !client.redirect_uris.contains(&params.redirect_uri) {
         return Err(AppError::bad_request("redirect_uri not registered"));
     }
 
     // Find provider
-    let providers = store.list_providers()?;
+    let providers = state.store.list_providers().await?;
     let db_provider = if let Some(name) = &params.provider {
         providers
             .iter()
@@ -170,7 +171,6 @@ async fn authorize(
     };
 
     let provider = Provider::from_db(db_provider)?;
-    drop(store);
 
     // Build OAuth state that encodes our pending authorization
     // Format: <random>:<client_id>:<redirect_uri>:<code_challenge>:<original_state>
@@ -213,11 +213,11 @@ async fn oauth_callback(
     let redirect_uri = base64_decode(redirect_uri_b64)
         .map_err(|_| AppError::bad_request("invalid state encoding"))?;
 
-    let store = state.store.lock().await;
-
     // Load provider
-    let db_provider = store
-        .get_provider_by_name(&provider_name)?
+    let db_provider = state
+        .store
+        .get_provider_by_name(&provider_name)
+        .await?
         .ok_or_else(|| AppError::bad_request("unknown provider"))?;
     let provider = Provider::from_db(&db_provider)?;
 
@@ -225,17 +225,16 @@ async fn oauth_callback(
         "{}{}/oauth/callback/{}",
         state.external_url, state.base_path, provider_name
     );
-    drop(store);
 
     // Exchange code with provider
     let provider_token = provider.exchange_code(&params.code, &callback_uri).await?;
     let provider_user = provider.get_user_info(&provider_token).await?;
 
-    let store = state.store.lock().await;
-
     // Look up user by provider identity
-    let user = store
-        .get_user_by_provider_identity(db_provider.id, &provider_user.provider_user_id)?
+    let user = state
+        .store
+        .get_user_by_provider_identity(db_provider.id, &provider_user.provider_user_id)
+        .await?
         .ok_or_else(|| {
             AppError::status(
                 StatusCode::FORBIDDEN,
@@ -247,8 +246,10 @@ async fn oauth_callback(
         })?;
 
     // Create auth code for the client
-    let auth_code =
-        store.create_auth_code(client_id, user.id, code_challenge, &redirect_uri)?;
+    let auth_code = state
+        .store
+        .create_auth_code(client_id, user.id, code_challenge, &redirect_uri)
+        .await?;
 
     // Redirect back to client with code
     let sep = if redirect_uri.contains('?') { "&" } else { "?" };
@@ -296,8 +297,7 @@ async fn token_exchange(
                 .as_deref()
                 .ok_or_else(|| AppError::bad_request("missing code_verifier"))?;
 
-            let store = state.store.lock().await;
-            let auth_code = store.consume_auth_code(code)?;
+            let auth_code = state.store.consume_auth_code(code).await?;
 
             // Verify PKCE: SHA256(verifier) == challenge
             let computed_challenge = pkce_challenge(verifier);
@@ -312,7 +312,10 @@ async fn token_exchange(
                 }
             }
 
-            let pair = store.create_token_pair(&auth_code.client_id, auth_code.user_id)?;
+            let pair = state
+                .store
+                .create_token_pair(&auth_code.client_id, auth_code.user_id)
+                .await?;
             let expires_in = (pair.expires_at - chrono::Utc::now()).num_seconds();
 
             Ok(axum::Json(TokenResponse {
@@ -328,16 +331,17 @@ async fn token_exchange(
                 .as_deref()
                 .ok_or_else(|| AppError::bad_request("missing refresh_token"))?;
 
-            let store = state.store.lock().await;
-            let (user, client_id) = store
-                .get_user_by_refresh_token(refresh)?
+            let (user, client_id) = state
+                .store
+                .get_user_by_refresh_token(refresh)
+                .await?
                 .ok_or_else(|| AppError::bad_request("invalid refresh_token"))?;
 
             // Revoke old token pair
-            store.revoke_refresh_token(refresh)?;
+            state.store.revoke_refresh_token(refresh).await?;
 
             // Issue new pair
-            let pair = store.create_token_pair(&client_id, user.id)?;
+            let pair = state.store.create_token_pair(&client_id, user.id).await?;
             let expires_in = (pair.expires_at - chrono::Utc::now()).num_seconds();
 
             Ok(axum::Json(TokenResponse {
@@ -359,12 +363,12 @@ async fn auth_login(
     State(state): State<OAuthState>,
     Path(provider_name): Path<String>,
 ) -> Result<Response, AppError> {
-    let store = state.store.lock().await;
-    let db_provider = store
-        .get_provider_by_name(&provider_name)?
+    let db_provider = state
+        .store
+        .get_provider_by_name(&provider_name)
+        .await?
         .ok_or_else(|| AppError::bad_request("unknown provider"))?;
     let provider = Provider::from_db(&db_provider)?;
-    drop(store);
 
     // Generate a random state for CSRF protection
     let csrf_state = trivia_core::auth_store::sha256_hex(
@@ -384,9 +388,10 @@ async fn auth_callback(
     Path(provider_name): Path<String>,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response, AppError> {
-    let store = state.store.lock().await;
-    let db_provider = store
-        .get_provider_by_name(&provider_name)?
+    let db_provider = state
+        .store
+        .get_provider_by_name(&provider_name)
+        .await?
         .ok_or_else(|| AppError::bad_request("unknown provider"))?;
     let provider = Provider::from_db(&db_provider)?;
 
@@ -394,15 +399,14 @@ async fn auth_callback(
         "{}{}/auth/callback/{}",
         state.external_url, state.base_path, provider_name,
     );
-    drop(store);
 
     let provider_token = provider.exchange_code(&params.code, &callback_uri).await?;
     let provider_user = provider.get_user_info(&provider_token).await?;
 
-    let store = state.store.lock().await;
-
-    let user = store
-        .get_user_by_provider_identity(db_provider.id, &provider_user.provider_user_id)?
+    let user = state
+        .store
+        .get_user_by_provider_identity(db_provider.id, &provider_user.provider_user_id)
+        .await?
         .ok_or_else(|| {
             AppError::status(
                 StatusCode::FORBIDDEN,
@@ -413,7 +417,7 @@ async fn auth_callback(
             )
         })?;
 
-    let session = store.create_session(user.id)?;
+    let session = state.store.create_session(user.id).await?;
 
     // Set cookie scoped to base_path (or "/" if no base_path) and redirect home.
     let cookie_path = cookie_path(&state.base_path);
@@ -436,8 +440,7 @@ async fn auth_callback(
 
 async fn auth_logout(State(state): State<OAuthState>, headers: axum::http::HeaderMap) -> Response {
     if let Some(session_id) = extract_session_cookie(&headers) {
-        let store = state.store.lock().await;
-        let _ = store.delete_session(&session_id);
+        let _ = state.store.delete_session(&session_id).await;
     }
 
     let clear = format!(
@@ -475,15 +478,14 @@ async fn auth_me(
     }
 
     // Try session cookie
-    if let Some(session_id) = extract_session_cookie(&headers) {
-        let store = state.store.lock().await;
-        if let Some((_sess, user)) = store.get_session(&session_id)? {
-            return Ok(axum::Json(MeResponse {
-                username: user.username,
-                acl: user.acl,
-            })
-            .into_response());
-        }
+    if let Some(session_id) = extract_session_cookie(&headers)
+        && let Some((_sess, user)) = state.store.get_session(&session_id).await?
+    {
+        return Ok(axum::Json(MeResponse {
+            username: user.username,
+            acl: user.acl,
+        })
+        .into_response());
     }
 
     Err(AppError::status(StatusCode::UNAUTHORIZED, "not authenticated"))
@@ -492,8 +494,7 @@ async fn auth_me(
 async fn list_providers(
     State(state): State<OAuthState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let store = state.store.lock().await;
-    let providers = store.list_enabled_providers()?;
+    let providers = state.store.list_enabled_providers().await?;
     let names: Vec<&str> = providers.iter().map(|(name, _)| name.as_str()).collect();
     Ok(axum::Json(serde_json::json!({ "providers": names })))
 }
@@ -525,8 +526,7 @@ pub async fn extract_bearer_user(
         Some(t) => t,
         None => return Ok(None),
     };
-    let store = store.lock().await;
-    Ok(store.get_user_by_access_token(token)?)
+    store.get_user_by_access_token(token).await
 }
 
 fn pkce_challenge(verifier: &str) -> String {

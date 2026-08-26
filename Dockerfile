@@ -1,5 +1,7 @@
 # Built by .github/workflows/release.yml using prebuilt linux binaries.
 # Expects dist/${TARGETARCH}/trivia to exist (amd64 and arm64).
+# Those binaries are compiled with `--features s3vectors`, so the S3 Vectors
+# backend is available at runtime via `backend = "s3vectors"` / TRIVIA_BACKEND.
 FROM debian:trixie-slim
 
 ARG TARGETARCH

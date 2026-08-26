@@ -9,13 +9,13 @@ use tower_mcp::extract::{Extension, Json, State};
 use tower_mcp::oauth::token::TokenClaims;
 use tower_mcp::transport::stdio::StdioTransport;
 use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
-use trivia_core::{Embedder, Memory, MemoryStore, MemorizeResult, TriviaConfig};
+use trivia_core::{Embedder, Memory, MemoryBackend, MemorizeResult, TriviaConfig};
 
 use crate::acl::Acl;
 use crate::auth_middleware::acl_from_claims;
 
 struct AppState {
-    store: Arc<Mutex<MemoryStore>>,
+    store: Arc<dyn MemoryBackend>,
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
@@ -230,9 +230,8 @@ fn format_memories(memories: &[Memory], truncate: Option<usize>) -> String {
 }
 
 /// Helper: look up a memory's tags by mnemonic. Returns None if not found.
-async fn memory_tags(store: &Arc<Mutex<MemoryStore>>, mnemonic: &str) -> Result<Option<Vec<String>>> {
-    let s = store.lock().await;
-    match s.get_memory_by_mnemonic(mnemonic)? {
+async fn memory_tags(store: &Arc<dyn MemoryBackend>, mnemonic: &str) -> Result<Option<Vec<String>>> {
+    match store.get_memory_by_mnemonic(mnemonic).await? {
         Some(mem) => Ok(Some(mem.tags)),
         None => Ok(None),
     }
@@ -240,7 +239,7 @@ async fn memory_tags(store: &Arc<Mutex<MemoryStore>>, mnemonic: &str) -> Result<
 
 /// Build the MCP router with ACL enforcement.
 pub fn build_mcp_router(
-    store: Arc<Mutex<MemoryStore>>,
+    store: Arc<dyn MemoryBackend>,
     embedder: Arc<Mutex<Embedder>>,
     config: TriviaConfig,
     acl: Arc<Acl>,
@@ -250,9 +249,13 @@ pub fn build_mcp_router(
 }
 
 /// Serve MCP over stdio (no ACL restrictions).
-pub async fn serve(store: MemoryStore, embedder: Embedder, config: TriviaConfig) -> Result<()> {
+pub async fn serve(
+    store: Arc<dyn MemoryBackend>,
+    embedder: Embedder,
+    config: TriviaConfig,
+) -> Result<()> {
     let state = Arc::new(AppState {
-        store: Arc::new(Mutex::new(store)),
+        store,
         embedder: Arc::new(Mutex::new(embedder)),
         config,
         acl: Arc::new(Acl::open()),
@@ -295,8 +298,9 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 let skip_merge = !acl.is_open();
                 let embedding = app.embedder.lock().await.embed(&input.mnemonic)
                     .tool_context("embedding failed")?;
-                let result = app.store.lock().await
+                let result = app.store
                     .memorize_with_options(&input.mnemonic, &input.content, &tags, &embedding, skip_merge)
+                    .await
                     .tool_context("memorize failed")?;
                 Ok(CallToolResult::text(format_memorize_response(&input.mnemonic, &result)))
             },
@@ -319,8 +323,9 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 let tags = input.tags.as_deref();
                 let fts = input.full_text_search.as_deref();
                 let exclude = input.exclude_tags.as_deref();
-                let mut memories = app.store.lock().await
+                let mut memories = app.store
                     .recall(&embedding, limit, tags, fts, exclude)
+                    .await
                     .tool_context("recall failed")?;
 
                 // ACL: post-filter by read access
@@ -380,9 +385,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 let not_found = app.store
-                    .lock()
-                    .await
                     .rate_batch(&all, input.useful)
+                    .await
                     .tool_context("rate failed")?;
 
                 if not_found.is_empty() {
@@ -422,9 +426,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
 
                 app.store
-                    .lock()
-                    .await
                     .link(&input.source, &input.target, &input.link_type)
+                    .await
                     .tool_context("link failed")?;
                 Ok(CallToolResult::text(format!(
                     "Linked: {} --[{}]--> {}",
@@ -464,9 +467,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     .embed(&input.keep)
                     .tool_context("embedding failed")?;
                 app.store
-                    .lock()
-                    .await
                     .merge(&input.keep, &input.discard, &embedding)
+                    .await
                     .tool_context("merge failed")?;
                 Ok(CallToolResult::text(format!(
                     "Merged: {} absorbed {}",
@@ -489,14 +491,17 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 let tags = input.tags.as_deref();
 
                 if acl.is_open() {
-                    app.store.lock().await
+                    app.store
                         .export(dir, tags)
+                        .await
                         .tool_context("export failed")?;
                 } else {
                     // ACL: only export readable memories
                     let acl = acl.clone();
-                    app.store.lock().await
-                        .export_filtered(dir, tags, move |mem_tags| acl.check_read(mem_tags))
+                    let filter = move |mem_tags: &[String]| acl.check_read(mem_tags);
+                    app.store
+                        .export_filtered(dir, tags, &filter)
+                        .await
                         .tool_context("export failed")?;
                 }
 
@@ -524,9 +529,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 let mut embedder = app.embedder.lock().await;
                 let result = app
                     .store
-                    .lock()
-                    .await
                     .import(dir, &mut embedder)
+                    .await
                     .tool_context("import failed")?;
                 Ok(CallToolResult::text(format!(
                     "Imported: {} created, {} updated, {} unchanged",
@@ -547,9 +551,8 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 let (acl, _username) = acl_from_claims(&claims, &app.acl);
                 let tags = app
                     .store
-                    .lock()
-                    .await
                     .list_tags()
+                    .await
                     .tool_context("list-tags failed")?;
 
                 // ACL: post-filter by read access
@@ -618,7 +621,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                 }
                 drop(embedder);
 
-                let result = app.store.lock().await
+                let result = app.store
                     .edit_memory(
                         &input.mnemonic,
                         input.new_mnemonic.as_deref(),
@@ -629,6 +632,7 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                         &input.remove_mnemonics,
                         &mnemonic_embeddings,
                     )
+                    .await
                     .tool_context("edit failed")?;
 
                 let mut output = if result.re_embedded {
@@ -672,8 +676,9 @@ fn build_router(state: Arc<AppState>) -> McpRouter {
                     }
                 }
 
-                let count = app.store.lock().await
+                let count = app.store
                     .rename_tag(&input.old_tag, &input.new_tag)
+                    .await
                     .tool_context("rename-tag failed")?;
                 Ok(CallToolResult::text(format!(
                     "Renamed tag \"{}\" -> \"{}\" across {count} memories",

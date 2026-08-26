@@ -92,9 +92,42 @@ tags = ["my-project"]
 
 # Optional: override database path (default: ~/.claude/trivia.db)
 # database = "/path/to/trivia.db"
+
+# Optional: storage backend — "sqlite" (default) or "s3vectors"
+# backend = "sqlite"
 ```
 
 Config discovery walks up from CWD (or `CLAUDE_PLUGIN_ROOT`) to find the nearest `trivia.toml`. CLI flags are additive with config tags.
+
+## Storage Backends
+
+Retrieval sits behind a `MemoryBackend` trait: the backend does storage and the
+initial KNN search, then a pure, backend-agnostic reranker applies the composite
+score. Pick a backend with `--backend`, `backend =` in `trivia.toml`, or
+`TRIVIA_BACKEND`.
+
+- **`sqlite`** (default) — local [sqlite-vec](https://github.com/asg017/sqlite-vec)
+  index. Zero-config, offline, supports full-text keyword boosting.
+- **`s3vectors`** — [Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html).
+  Vectors and memory records live in an S3 vector index; recall runs
+  `QueryVectors`. No local database needed for memory (the web server still keeps
+  auth/sessions in local SQLite). No lexical/FTS boost. Ships in release binaries;
+  build from source with `--features s3vectors`.
+
+```toml
+backend = "s3vectors"
+
+[s3vectors]
+bucket = "my-trivia-vectors"
+index  = "memories"
+region = "us-east-1"   # optional; falls back to the standard AWS chain
+```
+
+The bucket and index must already exist — provision them with Terraform's
+[`aws_s3vectors_vector_bucket`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3vectors_vector_bucket)
+and a vector index of dimension **384**, distance metric **euclidean**, with
+`record` configured as a **non-filterable** metadata key. Credentials come from
+the standard AWS provider chain (env, profile, IMDS, etc.).
 
 ## Web UI
 
@@ -109,16 +142,24 @@ Start with `trivia www` and open `http://localhost:3000`. Features:
 ## Architecture
 
 ```
-crates/core/     — MemoryStore, Embedder, config, export/import
-apps/cli/        — CLI binary (`trivia`), web server, MCP server
-apps/cli/www/    — React + TypeScript web UI (embedded at build time)
+crates/core/         — MemoryStore, Embedder, config, export/import
+crates/core/backend/ — MemoryBackend/AuthBackend traits + sqlite & s3vectors impls
+apps/cli/            — CLI binary (`trivia`), web server, MCP server
+apps/cli/www/        — React + TypeScript web UI (embedded at build time)
 ```
 
-SQLite with [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search. Embeddings via [fastembed](https://github.com/Anush008/fastembed-rs) (AllMiniLM-L6-V2).
+Storage is abstracted behind the `MemoryBackend` trait (storage, retrieval, and
+initial KNN); reranking is a pure Rust step shared by every backend. `AuthBackend`
+covers the web server's users/OAuth/sessions and is always SQLite. Default vector
+search is SQLite with [sqlite-vec](https://github.com/asg017/sqlite-vec);
+embeddings via [fastembed](https://github.com/Anush008/fastembed-rs)
+(AllMiniLM-L6-V2). See [Storage Backends](#storage-backends).
 
 ## Environment Variables
 
 - `TRIVIA_DB` — database path (overrides config and default)
+- `TRIVIA_BACKEND` — storage backend: `sqlite` or `s3vectors`
+- `TRIVIA_S3_BUCKET` / `TRIVIA_S3_INDEX` / `TRIVIA_S3_REGION` — S3 Vectors settings
 - `CLAUDE_PLUGIN_ROOT` — plugin root for config discovery
 
 ## License

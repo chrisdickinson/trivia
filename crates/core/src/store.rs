@@ -975,6 +975,32 @@ impl MemoryStore {
         fts_query: Option<&str>,
         exclude_tags: Option<&[String]>,
     ) -> Result<Vec<Memory>> {
+        let RecallCandidates {
+            mut memories,
+            fts_matches,
+        } = self.recall_candidates(query_embedding, limit, tags, fts_query, exclude_tags)?;
+
+        // Reranking is a pure, backend-agnostic step.
+        rerank(&mut memories, &self.scoring, &fts_matches, Utc::now());
+        memories.truncate(limit);
+
+        let titles: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
+        self.bump_recall_stats(&titles)?;
+
+        Ok(memories)
+    }
+
+    /// Fetch recall candidates: the initial KNN over mnemonic vectors plus the
+    /// metadata needed for reranking (tags, stats, links) and the FTS match set.
+    /// Candidates come back unscored — feed them to [`rerank`] to score them.
+    pub fn recall_candidates(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        tags: Option<&[String]>,
+        fts_query: Option<&str>,
+        exclude_tags: Option<&[String]>,
+    ) -> Result<RecallCandidates> {
         // Overfetch 5x for composite scoring reranking (extra to compensate for dedup)
         let base_fetch = limit * 5;
         let fetch_limit = match tags {
@@ -1071,99 +1097,29 @@ impl MemoryStore {
             mem.links = self.get_links(&mem.mnemonic)?;
         }
 
-        // Compute composite scores
-        let similarity_map: std::collections::HashMap<String, f64> = memories
+        Ok(RecallCandidates {
+            memories,
+            fts_matches,
+        })
+    }
+
+    /// Bump recall_count and last_recalled_at for the given memory titles.
+    pub fn bump_recall_stats(&self, titles: &[&str]) -> Result<()> {
+        if titles.is_empty() {
+            return Ok(());
+        }
+        let placeholders: Vec<String> =
+            (1..=titles.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE title IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = titles
             .iter()
-            .map(|m| (m.mnemonic.clone(), 1.0 - m.distance))
+            .map(|m| m as &dyn rusqlite::types::ToSql)
             .collect();
-        let lambda = (2.0_f64).ln() / self.scoring.half_life_days;
-        let now = Utc::now();
-
-        for mem in &mut memories {
-            let similarity = 1.0 - mem.distance;
-
-            let recency = match mem.last_recalled_at {
-                Some(ts) => {
-                    let days = days_between(ts, now);
-                    (-lambda * days).exp()
-                }
-                None => 0.0,
-            };
-
-            let frequency = (1.0 + mem.recall_count as f64).ln();
-
-            let link_boost: f64 = mem
-                .links
-                .iter()
-                .filter_map(|l| {
-                    let other = if l.source_mnemonic == mem.mnemonic {
-                        &l.target_mnemonic
-                    } else {
-                        &l.source_mnemonic
-                    };
-                    similarity_map.get(other).copied()
-                })
-                .take(3)
-                .sum();
-
-            let rating_signal = {
-                let total = (mem.useful_count + mem.not_useful_count) as f64;
-                if total > 0.0 {
-                    let ratio = (mem.useful_count - mem.not_useful_count) as f64 / total;
-                    let confidence = total.sqrt() / (total.sqrt() + 1.0);
-                    ratio * confidence
-                } else {
-                    0.0
-                }
-            };
-
-            let tag_boost = if !self.scoring.boost_tags.is_empty() {
-                let matches = mem
-                    .tags
-                    .iter()
-                    .filter(|t| self.scoring.boost_tags.contains(t))
-                    .count();
-                (matches as f64) / (self.scoring.boost_tags.len() as f64)
-            } else {
-                0.0
-            };
-
-            let fts_boost = if fts_matches.contains(&mem.mnemonic) {
-                1.0
-            } else {
-                0.0
-            };
-
-            mem.score = self.scoring.similarity_weight * similarity
-                + self.scoring.recency_weight * recency
-                + self.scoring.frequency_weight * frequency
-                + self.scoring.link_weight * link_boost
-                + self.scoring.rating_weight * rating_signal
-                + self.scoring.tag_boost_weight * tag_boost
-                + self.scoring.fts_weight * fts_boost;
-        }
-
-        // Sort by score descending, take limit
-        memories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        memories.truncate(limit);
-
-        // Update recall stats for all returned memories (by title)
-        let titles: Vec<&str> = memories.iter().map(|m| m.mnemonic.as_str()).collect();
-        if !titles.is_empty() {
-            let placeholders: Vec<String> =
-                (1..=titles.len()).map(|i| format!("?{i}")).collect();
-            let sql = format!(
-                "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE title IN ({})",
-                placeholders.join(", ")
-            );
-            let params: Vec<&dyn rusqlite::types::ToSql> = titles
-                .iter()
-                .map(|m| m as &dyn rusqlite::types::ToSql)
-                .collect();
-            self.conn.execute(&sql, params.as_slice())?;
-        }
-
-        Ok(memories)
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
     }
 
     pub fn list_all_summaries(&self) -> Result<Vec<MemorySummary>> {
@@ -1746,6 +1702,101 @@ fn parse_sqlite_datetime(s: &str) -> DateTime<Utc> {
 fn days_between(earlier: DateTime<Utc>, later: DateTime<Utc>) -> f64 {
     let duration = later.signed_duration_since(earlier);
     (duration.num_seconds() as f64 / 86400.0).max(0.0)
+}
+
+/// Candidate set returned by a backend's initial KNN retrieval, ready for
+/// [`rerank`]. `memories` carry a raw `distance` and `score == 0.0`.
+#[derive(Debug, Clone, Default)]
+pub struct RecallCandidates {
+    pub memories: Vec<Memory>,
+    pub fts_matches: std::collections::HashSet<String>,
+}
+
+/// Pure, backend-agnostic composite-scoring rerank.
+///
+/// Assigns each candidate a `score` from similarity + recency + frequency +
+/// link + rating + tag-boost + FTS signals, then sorts by score descending.
+/// This is the "reranking" step that runs identically regardless of whether
+/// candidates came from SQLite-vec or a remote vector index — it only reads
+/// data already loaded into each [`Memory`]. Backends that lack a signal
+/// (e.g. no lexical search) simply pass an empty `fts_matches` set.
+pub fn rerank(
+    memories: &mut [Memory],
+    scoring: &ScoringConfig,
+    fts_matches: &std::collections::HashSet<String>,
+    now: DateTime<Utc>,
+) {
+    let similarity_map: std::collections::HashMap<String, f64> = memories
+        .iter()
+        .map(|m| (m.mnemonic.clone(), 1.0 - m.distance))
+        .collect();
+    let lambda = (2.0_f64).ln() / scoring.half_life_days;
+
+    for mem in memories.iter_mut() {
+        let similarity = 1.0 - mem.distance;
+
+        let recency = match mem.last_recalled_at {
+            Some(ts) => {
+                let days = days_between(ts, now);
+                (-lambda * days).exp()
+            }
+            None => 0.0,
+        };
+
+        let frequency = (1.0 + mem.recall_count as f64).ln();
+
+        let link_boost: f64 = mem
+            .links
+            .iter()
+            .filter_map(|l| {
+                let other = if l.source_mnemonic == mem.mnemonic {
+                    &l.target_mnemonic
+                } else {
+                    &l.source_mnemonic
+                };
+                similarity_map.get(other).copied()
+            })
+            .take(3)
+            .sum();
+
+        let rating_signal = {
+            let total = (mem.useful_count + mem.not_useful_count) as f64;
+            if total > 0.0 {
+                let ratio = (mem.useful_count - mem.not_useful_count) as f64 / total;
+                let confidence = total.sqrt() / (total.sqrt() + 1.0);
+                ratio * confidence
+            } else {
+                0.0
+            }
+        };
+
+        let tag_boost = if !scoring.boost_tags.is_empty() {
+            let matches = mem
+                .tags
+                .iter()
+                .filter(|t| scoring.boost_tags.contains(t))
+                .count();
+            (matches as f64) / (scoring.boost_tags.len() as f64)
+        } else {
+            0.0
+        };
+
+        let fts_boost = if fts_matches.contains(&mem.mnemonic) {
+            1.0
+        } else {
+            0.0
+        };
+
+        mem.score = scoring.similarity_weight * similarity
+            + scoring.recency_weight * recency
+            + scoring.frequency_weight * frequency
+            + scoring.link_weight * link_boost
+            + scoring.rating_weight * rating_signal
+            + scoring.tag_boost_weight * tag_boost
+            + scoring.fts_weight * fts_boost;
+    }
+
+    memories.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 struct MemoryRow {
