@@ -1,15 +1,17 @@
 # Built by .github/workflows/release.yml using prebuilt linux binaries.
 # Expects dist/${TARGETARCH}/trivia to exist (amd64 and arm64).
-FROM debian:trixie-slim
+# Validate locally with `just docker-test`.
+
+# distroless has no shell, so create the nonroot-owned data dir here.
+FROM busybox:1.37 AS data
+RUN mkdir /data
+
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 ARG TARGETARCH
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
- && rm -rf /var/lib/apt/lists/*
-
-COPY dist/${TARGETARCH}/trivia /usr/local/bin/trivia
-RUN chmod +x /usr/local/bin/trivia
+COPY --from=data --chown=nonroot:nonroot /data /data
+COPY --chmod=755 dist/${TARGETARCH}/trivia /usr/local/bin/trivia
 
 ENV BIND_ADDR=0.0.0.0:3000 \
     TRIVIA_DB=/data/trivia.db
