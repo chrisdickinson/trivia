@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 sqlite-vec = "0.1"
 zerocopy = "0.8"
 fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls"] }
