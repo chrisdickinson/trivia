@@ -15,7 +15,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sqlite-vec = "0.1"
 zerocopy = "0.8"
 fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-native-tls"] }
-tower-mcp = { version = "0.12", features = ["full"] }
+tower-mcp = { version = "0.25", features = ["full"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
