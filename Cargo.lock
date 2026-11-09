@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "trivia-core"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "chrono",
