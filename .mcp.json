@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "trivia": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/trivia",
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/launch",
       "args": ["mcp"]
     }
   }

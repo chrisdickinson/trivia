@@ -2,12 +2,26 @@
 set -euo pipefail
 
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-BIN_DIR="${PLUGIN_ROOT}/bin"
+
+# --print-path: after ensuring the binary exists, print its path on stdout.
+# Without it, print nothing on stdout (SessionStart hook stdout lands in context).
+PRINT_PATH=0
+[ "${1:-}" = "--print-path" ] && PRINT_PATH=1
+
+# Cache outside the plugin root: some hosts re-extract the plugin per session,
+# which would discard anything written to ${PLUGIN_ROOT}/bin.
+VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${PLUGIN_ROOT}/.claude-plugin/plugin.json" | head -n1)"
+BIN_DIR="${TRIVIA_BIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/trivia/${VERSION:-latest}}"
 BIN="${BIN_DIR}/trivia"
+
+done_ok() {
+  [ "$PRINT_PATH" = 1 ] && printf '%s\n' "$BIN"
+  exit 0
+}
 
 # If binary already exists and is executable, we're done
 if [ -x "$BIN" ]; then
-  exit 0
+  done_ok
 fi
 
 mkdir -p "$BIN_DIR"
@@ -34,17 +48,24 @@ esac
 
 # Try downloading from GitHub releases
 REPO="chrisdickinson/trivia"
-RELEASE_URL="https://github.com/${REPO}/releases/latest/download/trivia-${TARGET}.tar.gz"
+if [ -n "$VERSION" ]; then
+  RELEASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}/trivia-${TARGET}.tar.gz"
+else
+  RELEASE_URL="https://github.com/${REPO}/releases/latest/download/trivia-${TARGET}.tar.gz"
+fi
 
 if command -v curl &>/dev/null; then
-  HTTP_CODE=$(curl -sL -o /tmp/trivia-release.tar.gz -w "%{http_code}" "$RELEASE_URL" 2>/dev/null || echo "000")
-  if [ "$HTTP_CODE" = "200" ]; then
-    tar -xzf /tmp/trivia-release.tar.gz -C "$BIN_DIR"
-    chmod +x "$BIN"
-    rm -f /tmp/trivia-release.tar.gz
-    exit 0
+  TMP_TGZ="$(mktemp "${TMPDIR:-/tmp}/trivia-release.XXXXXX")"
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trivia-extract.XXXXXX")"
+  HTTP_CODE=$(curl -sL -o "$TMP_TGZ" -w "%{http_code}" "$RELEASE_URL" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ] && tar -xzf "$TMP_TGZ" -C "$TMP_DIR"; then
+    chmod +x "$TMP_DIR/trivia"
+    # Atomic rename so concurrent sessions never exec a half-written file.
+    mv -f "$TMP_DIR/trivia" "$BIN"
+    rm -rf "$TMP_TGZ" "$TMP_DIR"
+    done_ok
   fi
-  rm -f /tmp/trivia-release.tar.gz
+  rm -rf "$TMP_TGZ" "$TMP_DIR"
 fi
 
 # Fallback: build from source
@@ -57,10 +78,10 @@ if command -v cargo &>/dev/null; then
     (cd "$WWW_DIR" && npm ci && npm run build) >&2
   fi
 
-  cargo build --manifest-path "${PLUGIN_ROOT}/apps/cli/Cargo.toml" --release --quiet
+  cargo build --manifest-path "${PLUGIN_ROOT}/apps/cli/Cargo.toml" --release --quiet >&2
   cp "${PLUGIN_ROOT}/target/release/trivia" "$BIN"
   chmod +x "$BIN"
-  exit 0
+  done_ok
 fi
 
 echo "Error: could not install trivia. Install cargo or download a release." >&2

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# MCP entrypoint. Ensures the trivia binary is installed, then execs it.
+#
+# The MCP host may spawn this before (or without) running the SessionStart
+# hook, and may hand us a freshly-extracted plugin root each session, so we
+# can't rely on ${CLAUDE_PLUGIN_ROOT}/bin/trivia already existing.
+#
+# stdout is the MCP transport: nothing but the server may write to it.
+set -euo pipefail
+
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+BIN="$("$PLUGIN_ROOT/scripts/install" --print-path)"
+exec "$BIN" "$@"
